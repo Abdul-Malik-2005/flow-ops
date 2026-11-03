@@ -6,6 +6,7 @@ from sqlalchemy import (
     DateTime,
     Integer,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -45,12 +46,14 @@ class Inventory(Base):
         Integer,
         nullable=False,
         default=0,
+        server_default=text("0"),
     )
 
     quantity_reserved: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
         default=0,
+        server_default=text("0"),
     )
 
     created_at: Mapped[datetime] = mapped_column(
