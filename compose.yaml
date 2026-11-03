@@ -1,0 +1,25 @@
+services:
+  inventory-db:
+    image: postgres:17-alpine
+    container_name: flowops-inventory-db
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: inventory_db
+      POSTGRES_USER: inventory_user
+      POSTGRES_PASSWORD: dev_password
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - inventory_postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U inventory_user -d inventory_db" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  inventory_postgres_data:
