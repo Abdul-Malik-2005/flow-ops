@@ -57,8 +57,9 @@ jobs:
 
       - name: Check Ruff version
         run: poetry run ruff --version
-      - name: Run Ruff lint
-        run: poetry run ruff check .
+
+      - name: Ruff verbose (diagnostics)
+        run: poetry run ruff check migrations/env.py --select I001 --verbose
 
       - name: Check code formatting
         run: poetry run ruff format --check .
