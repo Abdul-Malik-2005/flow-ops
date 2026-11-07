@@ -8,8 +8,10 @@ from app.db.session import engine
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    yield
-    await engine.dispose()
+    try:
+        yield
+    finally:
+        await engine.dispose()
 
 
 app = FastAPI(
