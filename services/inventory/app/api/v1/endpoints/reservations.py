@@ -1,5 +1,4 @@
-
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_session
@@ -20,10 +19,17 @@ router = APIRouter(
     "/",
     response_model=ReservationResponse,
     status_code=status.HTTP_201_CREATED,
+    responses={
+        status.HTTP_200_OK: {
+            "model": ReservationResponse,
+            "description": "Reservation already exists",
+        },
+    },
 )
 async def create_reservation(
     data: ReservationCreate,
-    session: AsyncSession = Depends(get_session),
+    response: Response,
+    session: AsyncSession = Depends(get_session),  # noqa: B008
 ) -> ReservationResponse:
     service = ReservationService(session)
 
@@ -43,14 +49,6 @@ async def create_reservation(
         ) from exc
 
     if not created:
-        from fastapi import Response
-
-        return Response(
-            content=ReservationResponse.model_validate(
-                reservation
-            ).model_dump_json(),
-            status_code=status.HTTP_200_OK,
-            media_type="application/json",
-        )
+        response.status_code = status.HTTP_200_OK
 
     return ReservationResponse.model_validate(reservation)

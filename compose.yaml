@@ -16,10 +16,43 @@ services:
       - inventory_postgres_data:/var/lib/postgresql/data
 
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U inventory_user -d inventory_db" ]
+      test: ["CMD-SHELL", "pg_isready -U inventory_user -d inventory_db"]
       interval: 5s
       timeout: 3s
       retries: 5
+
+  inventory-api:
+    build:
+      context: ./services/inventory
+      dockerfile: Dockerfile
+
+    container_name: flowops-inventory-api
+    restart: unless-stopped
+
+    environment:
+      DATABASE_URL: postgresql+asyncpg://inventory_user:dev_password@inventory-db:5432/inventory_db
+      DEBUG: "false"
+      ENVIRONMENT: production
+
+    ports:
+      - "8000:8000"
+
+    depends_on:
+      inventory-db:
+        condition: service_healthy
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
 volumes:
   inventory_postgres_data:

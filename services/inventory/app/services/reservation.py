@@ -1,4 +1,3 @@
-
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -56,8 +55,13 @@ class ReservationService:
         data: ReservationCreate,
     ) -> tuple[Reservation, bool]:
         async with self.session.begin():
-            existing_reservation = (
-                await self.reservation_repo.get_by_order_id(data.order_id)
+            # Сначала сериализуем операции с одинаковым order_id.
+            await self.reservation_repo.lock_order_id(data.order_id)
+
+            # После получения блокировки проверяем,
+            # не была ли резервация уже создана.
+            existing_reservation = await self.reservation_repo.get_by_order_id(
+                data.order_id
             )
 
             if existing_reservation:
@@ -65,25 +69,16 @@ class ReservationService:
 
             items = self.normalize_items(data.items)
 
+            # Блокируем строки склада в детерминированном порядке.
             inventory_items = await self.inventory_repo.get_many_for_update(
-                [
-                    (item.product_id, item.warehouse_id)
-                    for item in items
-                ]
+                [(item.product_id, item.warehouse_id) for item in items]
             )
-
-            existing_reservation = (
-                await self.reservation_repo.get_by_order_id(data.order_id)
-            )
-
-            if existing_reservation:
-                return existing_reservation, False
 
             inventory_map = {
-                (item.product_id, item.warehouse_id): item
-                for item in inventory_items
+                (item.product_id, item.warehouse_id): item for item in inventory_items
             }
 
+            # Проверяем наличие всех товаров и достаточность остатков.
             for item in items:
                 key = (item.product_id, item.warehouse_id)
                 inventory = inventory_map.get(key)
@@ -115,9 +110,7 @@ class ReservationService:
             await self.reservation_repo.create(reservation)
 
             for item in items:
-                inventory = inventory_map[
-                    (item.product_id, item.warehouse_id)
-                ]
+                inventory = inventory_map[(item.product_id, item.warehouse_id)]
                 inventory.quantity_reserved += item.quantity
 
             await self.session.flush()
