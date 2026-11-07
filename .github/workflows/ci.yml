@@ -55,6 +55,8 @@ jobs:
       - name: Install dependencies
         run: poetry install --with dev
 
+      - name: Check Ruff version
+        run: poetry run ruff --version
       - name: Run Ruff lint
         run: poetry run ruff check .
 
