@@ -1,4 +1,4 @@
-name: Inventory Service CI
+name: CI
 
 on:
   push:
@@ -63,3 +63,57 @@ jobs:
 
       - name: Build Docker image
         run: docker build -t flowops-inventory:ci .
+
+  identity:
+    name: Identity Service Checks
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: identity_test_user
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: identity_test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U identity_test_user -d identity_test_db"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    defaults:
+      run:
+        working-directory: services/identity
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://identity_test_user:test_password@localhost:5432/identity_test_db
+      TEST_DATABASE_URL: postgresql+asyncpg://identity_test_user:test_password@localhost:5432/identity_test_db
+      DEBUG: "false"
+      ENVIRONMENT: testing
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: "pip"
+
+      - name: Install Poetry
+        run: pip install poetry==2.4.3
+
+      - name: Install dependencies
+        run: poetry install --with dev
+
+      - name: Check code formatting
+        run: poetry run ruff format --check .
+
+      - name: Ruff lint
+        run: poetry run ruff check .
+
+      - name: Build Docker image
+        run: docker build -t flowops-identity:ci .
