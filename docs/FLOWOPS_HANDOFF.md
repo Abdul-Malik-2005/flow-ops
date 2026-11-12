@@ -1,733 +1,481 @@
 # FlowOps --- техническая передача проекта (Handoff)
 
-**Назначение:** передать проект другой AI-модели/разработчику так, чтобы
-продолжение началось с правильной архитектурной и технической точки, без
-повторной реализации уже готового Inventory Service.
+**Актуально на:** конец Шага 1 Identity Service (каркас Identity поднят,
+CI зелёный, Docker собирается).\
+**Репозиторий:** https://github.com/Abdul-Malik-2005/flow-ops\
+**Наставник:** senior Python Backend архитектор.
 
-**Текущая контрольная точка:** Inventory Service реализован,
-протестирован, собран в Docker и проходит GitHub Actions CI по
-последнему подтверждению пользователя. Следующий этап --- проектирование
-и разработка Order Service.
+Общение на русском, уровень Middle+, без базовых объяснений FastAPI.
+Работать небольшими этапами, не переходить к следующему, пока текущий не
+проверен. Давать полный код файла с точным путём. Не менять
+архитектурные решения молча.
 
-> Документ составлен по истории разработки, присланным исходникам и
-> актуальному дереву проекта. Это не повторный запуск тестов и не
-> гарантия, что файлы не менялись после последнего сообщения. Перед
-> изменениями фактический Git checkout --- источник истины.
+------------------------------------------------------------------------
 
-## 1. Идея FlowOps
+## 1. Идея и стек
 
-**FlowOps** --- портфолио-проект уровня Middle+ Python Backend:
-backend-платформа управления заказами, складскими остатками, оплатами и
-уведомлениями для интернет-магазина.
+FlowOps --- портфолио-проект Middle+ Python Backend: микросервисная
+платформа заказов, склада, оплат и уведомлений. Каждый сервис владеет
+собственной БД; прямой доступ к чужим таблицам запрещён.
 
-Цель --- построить связную систему с реальными инженерными задачами, а
-не набор несвязанных CRUD-приложений:
+**Стек:** Python 3.14+, FastAPI, Pydantic/pydantic-settings, PostgreSQL
+17, SQLAlchemy 2.x async, asyncpg, Alembic, Poetry 2.4.3,
+Docker/Compose, pytest/pytest-asyncio, Ruff, HTTPX.
 
--   микросервисная архитектура и границы ответственности;
--   отдельная база данных у каждого сервиса;
--   HTTP- и асинхронное межсервисное взаимодействие;
--   транзакции, конкурентный доступ и идемпотентность;
--   обработка ошибок, таймаутов и отказов;
--   миграции, тестирование, контейнеризация и CI;
--   наблюдаемость и эксплуатационные практики.
+RabbitMQ, Redis, Nginx и Prometheus внедряются по мере появления
+сервисов, а не заранее все сразу. Kafka, Kubernetes и Service Mesh не
+входят в текущий план. Saga/CQRS не обязательны --- применять только при
+обоснованной необходимости.
 
-Проект служит серьёзной портфолио/дипломной работой и практикой для
-выхода на Middle+ Python Backend.
+**Порядок реализации:** Inventory (завершён) → Identity → Order →
+Catalog → Payment → Notification.
 
-## 2. Планируемые микросервисы
+Order строится по варианту B: асинхронная оркестрация через RabbitMQ и
+transactional outbox.
 
-  -----------------------------------------------------------------------
-  Сервис                              Ответственность
-  ----------------------------------- -----------------------------------
-  Identity Service                    Пользователи,
-                                      регистрация/аутентификация, роли и
-                                      доступ
+------------------------------------------------------------------------
 
-  Catalog Service                     Каталог товаров и информация о
-                                      товарах
+## 2. Состояние по сервисам
 
-  Inventory Service                   Складские остатки и резервации
-                                      товаров
+### Inventory Service --- ЗАВЕРШЁН, НЕ ПЕРЕПИСЫВАТЬ
 
-  Order Service                       Создание и жизненный цикл заказов,
-                                      оркестрация заказа
+- 16 тестов passed, Docker, CI, Alembic.
+- Владеет складскими остатками и резервациями.
+- Идемпотентен по `order_id`.
+- Использует advisory lock по `order_id` и `SELECT FOR UPDATE` по
+  складским строкам.
+- Endpoint: `POST /api/v1/reservations/`.
+- Health endpoint: `GET /health`.
+- Подробности реализации находятся в предыдущей версии handoff (разделы
+  про Inventory).
 
-  Payment Service                     Платежи и их состояния
+### Identity Service --- ШАГ 1 ЗАКРЫТ (каркас)
 
-  Notification Service                Уведомления о событиях и изменениях
-                                      состояния
-  -----------------------------------------------------------------------
+Реализовано:
 
-Это целевая карта, а не утверждение, что все сервисы уже реализованы. На
-текущий момент в репозитории реализован Inventory Service. Следующий
-этап --- Order Service.
+- `services/identity/` как отдельный Poetry-проект
+  (`package-mode = false`, Poetry 2.4.3, Python 3.14+, версии
+  зависимостей 1-в-1 с Inventory).
 
-### Главный архитектурный принцип
+- Структура:
+  `app/{api/v1,core,db,models,repositories,schemas,services}`,
+  `migrations/`, `alembic.ini`, `Dockerfile`, `.dockerignore`,
+  `.env.example`, `.gitignore`.
 
-Каждый микросервис владеет своими данными и своей БД. Другой сервис не
-читает и не изменяет его таблицы напрямую.
+- `app/core/config.py` --- `Settings(BaseSettings)` с полями:
 
-Например: - Order Service не подключается к PostgreSQL Inventory
-Service; - Order Service обращается к Inventory Service через API; -
-Inventory Service остаётся единственным владельцем складских остатков и
-резерваций.
+  - `database_url`
+  - `test_database_url`
+  - `debug`
+  - `environment`
+  - JWT-заготовки:
+    - `jwt_algorithm="RS256"`
+    - `jwt_kid="identity-1"`
+    - `jwt_private_key_path=""`
+    - `jwt_public_key_path=""`
+    - `access_token_ttl_seconds=900`
+    - `refresh_token_ttl_seconds=2592000`
 
-Это обязательное архитектурное решение. Не обходить его ради упрощения.
+  JWT-поля на Шаге 1 ещё не используются --- это задел под Шаг 3.
 
-## 3. Технологический стек
+- `app/db/base.py` --- `Base(DeclarativeBase)`.
 
-Целевой стек:
+- `app/db/session.py` --- `create_async_engine`,
+  `async_sessionmaker(expire_on_commit=False)`, `get_session()`.
 
--   Python 3.14+
--   FastAPI
--   Pydantic / pydantic-settings
--   PostgreSQL 17
--   SQLAlchemy 2.x, async ORM
--   asyncpg
--   Alembic
--   Poetry
--   Docker и Docker Compose
--   pytest и pytest-asyncio
--   Ruff
--   HTTPX
--   Redis
--   RabbitMQ
--   Kafka
--   Prometheus и Grafana
--   Kubernetes
--   GitHub Actions
+- `app/main.py` ---
+  `FastAPI(title="FlowOps Identity Service", lifespan=lifespan)`,
+  `include_router(api_v1_router, prefix="/api/v1")`, `GET /health`.
 
-Не все перечисленные технологии уже внедрены. Redis, RabbitMQ, Kafka,
-Prometheus, Grafana и Kubernetes относятся к дальнейшему плану. Не нужно
-добавлять их в Inventory Service задним числом или внедрять в Order
-Service без обоснования.
+- `app/api/v1/router.py` --- пустой `APIRouter()`, наполнится на Шаге 4.
 
-## 4. Текущая структура репозитория
+- Alembic:
 
-Корень репозитория --- `flow_ops/`.
+  - `alembic.ini` --- URL в ini перезаписывается `env.py` из
+    `settings.database_url`;
+  - `migrations/env.py` --- async-режим, `compare_type=True`,
+    `from app import models  # noqa: F401`;
+  - `migrations/script.py.mako`, `migrations/README`;
+  - `migrations/versions/` пока пусто.
+
+- `pyproject.toml` содержит
+  `[tool.ruff] extend-exclude = ["migrations/versions"]` ---
+  сгенерированные миграции не линтуются, `env.py` линтуется.
+
+- Dockerfile: multi-stage, `python:3.14-slim`,
+  `ENV POETRY_VERSION=2.4.3`, non-root пользователь `app`.
+
+- Команда запуска Dockerfile:
+  `uvicorn app.main:app --host 0.0.0.0 --port 8000`.
+
+- Корневой `compose.yaml`:
+
+  - `identity-db`: `postgres:17-alpine`, наружный порт `5433:5432`,
+    volume `identity_postgres_data`, healthcheck;
+  - `identity-api`: build из `services/identity`, наружный порт
+    `8001:8000`, зависит от `identity-db` со статусом `service_healthy`,
+    имеет healthcheck через `/health`.
+
+- CI (`.github/workflows/ci.yml`): workflow `CI`, два параллельных job:
+
+  - `inventory` --- без изменений;
+  - `identity` --- PostgreSQL service `identity_test_db`,
+    `poetry install --with dev`, `ruff format --check`, `ruff check`,
+    `docker build -t flowops-identity:ci .`.
+
+- Pytest в job `identity` пока отсутствует --- добавить на Шаге 5.
+
+**Проверено на Шаге 1:**
+
+- `poetry install` --- без ошибок, lock сгенерирован Poetry 2.4.3.
+- `alembic current`, `alembic upgrade head` --- без ошибок (миграций
+  пока нет).
+- `alembic revision --autogenerate` --- получилась пустая миграция; она
+  удалена, так как была бесполезна. Настоящая миграция появится на Шаге
+  2.
+- `ruff check .` --- All checks passed.
+- `docker compose build identity-api` --- успешно.
+- `docker compose up identity-db identity-api` --- оба контейнера
+  healthy.
+- `curl http://localhost:8001/health` → `{"status":"healthy"}`.
+- Inventory на порту 8000 не сломан.
+- GitHub Actions: оба job зелёные.
+
+**Ещё не сделано (Шаги 2--5):**
+
+- Модели `User`, `RefreshToken`, `LoginAttempt` и миграция.
+- Безопасность: Argon2id, JWT (RS256), ключи, `get_current_user`, роли.
+- Схемы, репозитории, сервисный слой, эндпоинты (`/auth/register`,
+  `/auth/login`, `/auth/refresh`, `/auth/logout`, `/auth/me`, `/users`).
+- Тесты (минимум 10: unit + integration).
+- `/ready` с проверкой БД --- открытый вопрос, не блокирует.
+- Метрики Prometheus, Redis-кэш и Nginx --- по мере появления остальных
+  сервисов.
+
+------------------------------------------------------------------------
+
+## 3. Принятые архитектурные решения по Identity
+
+1.  Аутентификация реализуется отдельным Identity Service со своей БД.
+2.  Используются access и refresh токены:
+    - access TTL --- 15 минут;
+    - refresh TTL --- 30 дней.
+3.  Подпись JWT --- **RS256**:
+    - приватный ключ хранится только в Identity (локально в
+      `.env`/секрете, не в Git);
+    - публичный ключ передаётся проверяющим сервисам через `.env` на
+      первом этапе;
+    - JWKS планируется позже;
+    - в заголовке токена присутствует `kid` --- задел под ротацию
+      ключей.
+4.  Access claims: `sub`, `role`, `type=access`, `exp`, `iat`, `jti`,
+    `kid`.
+5.  Refresh claims: `sub`, `type=refresh`, `exp`, `iat`, `jti`, `kid`.
+    Claim `role` в refresh отсутствует --- роль читается из БД при
+    обновлении токенов.
+6.  Роли --- Enum `admin`/`user` в модели `User`, отдельная таблица
+    ролей не создаётся. В access token включается claim `role` ---
+    снимок роли на момент выпуска токена.
+7.  Пароли хранятся только в виде хеша **Argon2id** (`argon2-cffi`).
+    Пароли и хеши не попадают в логи или ответы API.
+8.  Регистрация (`register`) возвращает `201` и пользователя, но не
+    выдаёт токены.
+9.  Login:
+    - успешный --- `200` + access/refresh;
+    - неверные данные --- `401` без раскрытия существования email;
+    - `is_active=false` --- `403`;
+    - каждая попытка записывается в `LoginAttempt`.
+10. Refresh:
+    - возвращает `200` и новую пару токенов;
+    - старый refresh помечается `revoked_at`, `replaced_by_jti`
+      указывает на новый JTI;
+    - истёкший, отозванный или неизвестный refresh → `401`;
+    - повторное использование уже использованного refresh → `401` и
+      отзыв всей цепочки refresh-токенов пользователя.
+11. Logout возвращает `204` и отзывает только переданный refresh token
+    (текущую сессию).
+12. `GET /me` требует access token.
+13. `GET /api/v1/users` доступен только admin.
+14. Межсервисные вызовы (например, Order → Inventory) используют не
+    пользовательский токен, а отдельный сервисный заголовок/токен.
+    Конкретный механизм фиксируется в контракте Order.
+15. Порядок реализации Identity:
+    - каркас;
+    - модели и миграция;
+    - безопасность (хеширование, ключи, выпуск/проверка токенов);
+    - схемы, репозитории и сервис;
+    - эндпоинты и зависимости;
+    - тесты;
+    - Docker/CI-финализация.
+
+### Планируемые модели (Шаг 2)
+
+**User**
+
+- `id` --- UUID PK;
+- `email` --- unique index, нормализация в lower-case в сервисном слое;
+- `password_hash`;
+- `role` --- Enum `admin`/`user`, default `user`;
+- `is_active` --- bool, default `true`;
+- `created_at`, `updated_at` --- timezone-aware.
+
+**RefreshToken**
+
+- `jti` --- UUID PK;
+- `user_id` --- FK → `users.id`, `ON DELETE CASCADE`, индекс;
+- `expires_at`;
+- `revoked_at` --- nullable;
+- `replaced_by_jti` --- nullable;
+- `created_at`.
+
+**LoginAttempt**
+
+- `id` --- UUID PK;
+- `user_id` --- nullable FK → `users.id`, `ON DELETE SET NULL`;
+- `email`;
+- `success` --- bool;
+- `ip` --- nullable;
+- `created_at`;
+- индекс `(email, created_at)`.
+
+### Планируемые эндпоинты
+
+  ------------------------------------------------------------------------------------------
+  Метод             Endpoint                  Успешный ответ               Основные ошибки /
+                                                                           доступ
+  ----------------- ------------------------- ---------------------------- -----------------
+  POST              `/api/v1/auth/register`   `201` + user (`id`, `email`, Дубликат email →
+                                              `role`, `is_active`,         `409`; валидация
+                                              `created_at`)                → `422`
+
+  POST              `/api/v1/auth/login`      `200` + `access_token`,      Неверные данные →
+                                              `refresh_token`,             `401`; неактивный
+                                              `token_type=bearer`          пользователь →
+                                                                           `403`
+
+  POST              `/api/v1/auth/refresh`    `200` + новая пара токенов   Ошибки токена →
+                                                                           `401`; повторное
+                                                                           использование ---
+                                                                           отзыв цепочки
+
+  POST              `/api/v1/auth/logout`     `204`                        Отзывает
+                                                                           переданный
+                                                                           refresh
+
+  GET               `/api/v1/auth/me`         `200` + текущий пользователь Требует access
+                                                                           token
+
+  GET               `/api/v1/users`           `200` + список пользователей Только admin
+
+  GET               `/health`                 `200 {"status":"healthy"}`   Liveness
+  ------------------------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+
+## 4. Структура репозитория (актуальная)
 
 ``` text
 flow_ops/
-├── compose.yaml
+├── compose.yaml                         # inventory-db/api, identity-db/api
 ├── .github/
 │   └── workflows/
-│       └── ci.yml
+│       └── ci.yml                       # job'ы inventory и identity
 ├── docs/
-│   └── PROJECT_CONTEXT.md
+│   └── FLOWOPS_HANDOFF.md               # этот документ
 └── services/
-    └── inventory/
+    ├── inventory/                       # ЗАВЕРШЁН, не трогать
+    │   └── ...                          # см. предыдущую версию handoff
+    └── identity/                        # Шаг 1 закрыт
         ├── .dockerignore
-        ├── .env
+        ├── .env                          # локальный, в .gitignore
+        ├── .env.example
         ├── .gitignore
         ├── alembic.ini
-        ├── check_db.py
-        ├── Dockerfile
+        ├── Dockerfile                    # POETRY_VERSION=2.4.3
         ├── poetry.lock
-        ├── pyproject.toml
+        ├── pyproject.toml                # migrations/versions исключены из Ruff
         ├── migrations/
-        │   ├── env.py
+        │   ├── env.py                    # async, compare_type=True
         │   ├── README
         │   ├── script.py.mako
-        │   └── versions/
-        │       └── ddfe927be72e_create_inventory_tables.py
+        │   └── versions/                 # пока пусто
         ├── app/
-        │   ├── main.py
+        │   ├── __init__.py
+        │   ├── main.py                   # FastAPI, lifespan, /health
         │   ├── api/
         │   │   └── v1/
-        │   │       ├── router.py
-        │   │       └── endpoints/
-        │   │           └── reservations.py
+        │   │       └── router.py         # пустой APIRouter()
         │   ├── core/
-        │   │   └── config.py
+        │   │   └── config.py             # Settings + JWT-заготовки
         │   ├── db/
         │   │   ├── base.py
         │   │   └── session.py
         │   ├── models/
-        │   │   ├── inventory.py
-        │   │   ├── reservation.py
-        │   │   └── reservation_item.py
+        │   │   └── __init__.py           # пока пусто
         │   ├── repositories/
-        │   │   ├── inventory.py
-        │   │   └── reservation.py
+        │   │   └── __init__.py
         │   ├── schemas/
-        │   │   ├── inventory.py
-        │   │   └── reservation.py
+        │   │   └── __init__.py
         │   └── services/
-        │       └── reservation.py
-        └── tests/
-            ├── conftest.py
-            ├── test_database.py
-            ├── test_reservations.py
-            └── test_reservations_api.py
+        │       └── __init__.py
+        └── tests/                        # появится на Шаге 5
 ```
 
-В присланном `tree /F /A` также отображались `.pytest_cache`,
-`.ruff_cache` и `__pycache__`. Это генерируемые каталоги, не часть
-архитектуры и не должны переноситься как исходники.
-
-Есть отдельный каталог `services/inventory/alembic/`, который в
-присланном дереве выглядит пустым; фактическая конфигурация миграций
-находится в `migrations/` и `alembic.ini`. Не менять это наугад ---
-сначала проверить фактическую конфигурацию.
-
-В дереве есть `app/api/v1/router.py`, `app/schemas/inventory.py` и
-`check_db.py`. Их точное содержимое не было предметом последнего аудита;
-не предполагать, что они пустые или не используются, пока не проверены.
-
-## 5. Inventory Service --- завершённый этап
-
-### 5.1 Назначение
-
-Inventory Service отвечает за: - складские позиции; - физическое
-количество товара на складе; - зарезервированное количество; - доступный
-остаток; - создание резервации товаров для заказа; - защиту от
-overselling при конкурентных запросах.
-
-Основной сценарий: Order Service передаёт Inventory Service `order_id` и
-список позиций. Inventory Service атомарно резервирует нужные количества
-или отклоняет операцию.
-
-### 5.2 Слои приложения
-
-Принято разделение: - API endpoint --- HTTP-уровень, преобразование
-бизнес-ошибок в HTTP, вызов сервиса; - Service --- бизнес-логика и
-границы транзакции; - Repository --- SQL-запросы и операции с ORM; -
-Models --- схема данных и ORM-связи; - Schemas --- входные и выходные
-Pydantic-модели.
-
-Repository не делает `commit()` или `rollback()`. Транзакцией управляет
-Service.
-
-### 5.3 Модели и ограничения БД
-
-**Inventory** - Таблица `inventory`. - Составной первичный ключ
-`(product_id, warehouse_id)`. - `quantity_on_hand` --- физическое
-количество на складе. - `quantity_reserved` --- зарезервированное
-количество. - `available_quantity` --- вычисляемое Python-свойство:
-`quantity_on_hand - quantity_reserved`. - Check constraints: -
-`quantity_on_hand >= 0`; - `quantity_reserved >= 0`; -
-`quantity_reserved <= quantity_on_hand`. - UUID используется для
-идентификаторов. - `created_at` и `updated_at` --- timezone-aware
-timestamps.
-
-**Reservation** - Таблица `reservations`. - UUID primary key. -
-`order_id` уникален и обязателен: одна резервация на заказ. - `status`
---- PostgreSQL Enum со значениями `reserved`, `confirmed`, `released`. -
-`created_at`, `updated_at`. - Relationship `items` с
-`cascade="all, delete-orphan"`.
-
-**ReservationItem** - Таблица `reservation_items`. - UUID primary key. -
-FK `reservation_id -> reservations.id`, `ON DELETE CASCADE`. - Составной
-FK `(product_id, warehouse_id)` на
-`inventory(product_id, warehouse_id)`. - Check constraint
-`quantity > 0`. - Relationship `reservation` с `back_populates`.
-
-### 5.4 Бизнес-правила
-
-1.  Резервация создаётся по `order_id`.
-2.  Повторная операция с тем же `order_id` не создаёт вторую резервацию.
-3.  Повторный запрос возвращает существующую резервацию и признак
-    `created=False`.
-4.  Повторяющиеся позиции с одинаковыми `(product_id, warehouse_id)` в
-    одном запросе объединяются, их `quantity` суммируется.
-5.  Нормализованный список сортируется по `product_id`, затем
-    `warehouse_id`.
-6.  Проверяются все позиции до записи резервации.
-7.  Если хотя бы одной позиции нет или остатка недостаточно, вся
-    операция откатывается.
-8.  Резервирование нескольких позиций атомарно: все позиции
-    резервируются или ни одна.
-9.  При успехе `quantity_reserved` увеличивается на нужное количество.
-10. `quantity_on_hand` при резервировании не уменьшается: резерв ---
-    отдельная часть общего остатка.
-
-### 5.5 Конкурентность и блокировки
-
-Реализованы два независимых механизма блокировок.
-
-**A. Advisory lock по order_id**
-
-Перед проверкой существующей резервации Service получает PostgreSQL
-transaction-level advisory lock:
-
-``` python
-async def lock_order_id(self, order_id: UUID) -> None:
-    stmt = text(
-        """
-        SELECT pg_advisory_xact_lock(
-            hashtextextended(CAST(:order_id AS text), 0)
-        )
-        """
-    )
-    await self.session.execute(stmt, {"order_id": str(order_id)})
-```
-
-Зачем: - сериализовать одновременные запросы для одного `order_id`; - не
-допустить гонку, когда два запроса не нашли резервацию и оба пытаются её
-создать; - после ожидания второй запрос увидит результат первой
-транзакции и вернёт существующую резервацию.
+------------------------------------------------------------------------
 
-Advisory lock transaction-scoped и автоматически освобождается при
-commit/rollback. Хеш-коллизия может привести к лишнему ожиданию, но не к
-нарушению целостности.
+## 5. Обязательные правила проекта
 
-**Обязательное правило:** любой путь создания резервации должен брать
-этот lock до `get_by_order_id`. Уникальность `order_id` в БД ---
-дополнительная защита.
+1.  **Версия Poetry должна совпадать.** Версия в Dockerfile
+    (`ENV POETRY_VERSION=...`) должна точно совпадать с версией Poetry,
+    которой локально генерируется `poetry.lock`. Сейчас везде **2.4.3**.
+    Иначе `docker compose build` может завершиться ошибкой:
+    `pyproject.toml changed significantly since poetry.lock was last generated`.
 
-**B. SELECT FOR UPDATE по складским строкам**
+2.  **Любое изменение `pyproject.toml` требует обновления lock.** Даже
+    изменение секции `[tool.*]` → выполнить `poetry lock` и коммитить
+    `pyproject.toml` и `poetry.lock` вместе.
 
-`InventoryRepository.get_many_for_update()`: - выбирает записи по
-составным ключам `(product_id, warehouse_id)`; - использует
-`tuple_(...).in_(items)`; - сортирует по `product_id`, `warehouse_id`; -
-применяет `.with_for_update()`.
+3.  **Миграции в Docker --- стратегия A.** В `compose.yaml` для
+    `identity-api` использовать команду:
 
-Это блокирует найденные строки склада до конца транзакции и
-предотвращает одновременное резервирование одного остатка сверх
-доступного количества.
-
-Детерминированный порядок блокировок снижает вероятность deadlock при
-пересекающихся наборах товаров.
-
-**Не путать:** advisory lock защищает один `order_id`, а `FOR UPDATE`
-защищает складские остатки. Это разные задачи.
-
-**AsyncSession:** одну `AsyncSession` нельзя одновременно использовать
-из нескольких asyncio tasks. Одна бизнес-операция выполняется в одной
-сессии и одной транзакции.
-
-### 5.6 Транзакционный сценарий Service
-
-Текущий сценарий `ReservationService.create_reservation()`:
-
-1.  `async with self.session.begin():`.
-2.  Взять advisory lock для `order_id`.
-3.  Проверить существующую резервацию.
-4.  Если существует --- вернуть её и `False`.
-5.  Нормализовать повторяющиеся позиции.
-6.  Получить и заблокировать складские записи через
-    `get_many_for_update`.
-7.  Проверить наличие каждой записи и достаточность
-    `available_quantity`.
-8.  Создать `Reservation` вместе со списком `ReservationItem`.
-9.  Увеличить `quantity_reserved` в заблокированных ORM-объектах.
-10. Выполнить `flush()`.
-11. Вернуть `(reservation, True)`.
-12. При выходе из контекста транзакция коммитится; исключение приводит к
-    rollback.
-
-`flush()` отправляет SQL в рамках текущей транзакции, но не коммитит
-изменения.
-
-### 5.7 Исключения и HTTP
-
-Сервисные исключения: - `InventoryItemNotFoundError`; -
-`InsufficientStockError`.
-
-Endpoint преобразует их: - отсутствующая складская позиция → HTTP 404; -
-недостаточный остаток → HTTP 409; - новая резервация → HTTP 201; -
-повторная резервация → HTTP 200.
-
-Endpoint не содержит бизнес-логики и не обращается напрямую к
-Repository.
-
-### 5.8 API
-
-Известный endpoint:
-
-`POST /api/v1/reservations/`
-
-Успешный ответ --- `ReservationResponse`. В OpenAPI документирован
-альтернативный HTTP 200 для уже существующей резервации.
-
-Health endpoint:
-
-`GET /health`
-
-Возвращает `{"status": "healthy"}`. В текущей реализации это
-liveness-проверка FastAPI, а не readiness-проверка PostgreSQL. При
-недоступной БД `/health` может всё ещё отвечать успешно.
-
-### 5.9 Pydantic-схемы
-
-Вход: - `ReservationItemCreate`: UUID `product_id`, UUID `warehouse_id`,
-`quantity: int` с `Field(gt=0)`. - `ReservationCreate`: UUID `order_id`,
-`items` с `Field(min_length=1)`.
-
-Выход: - `ReservationItemResponse`; - `ReservationResponse`.
-
-Для response-моделей используется `ConfigDict(from_attributes=True)`,
-чтобы валидировать ORM-объекты.
-
-Возможное необязательное улучшение: рассмотреть `extra="forbid"` на
-входных схемах, если нужно отклонять неизвестные поля вместо их
-игнорирования. Это не блокирующий дефект.
-
-### 5.10 Репозитории
-
-`ReservationRepository`: - `lock_order_id()` --- advisory lock; -
-`get_by_order_id()` --- выборка резервации с
-`selectinload(Reservation.items)`; - `create()` --- `add()` +
-`flush()`; - `create_items()` --- `add_all()` + `flush()`.
-
-`create_items()` не нужен в основном сценарии, потому что дочерние
-позиции передаются через `Reservation(items=...)` и сохраняются через
-ORM relationship. Можно удалить при последующей уборке, но это
-необязательная очистка.
-
-`InventoryRepository`: - `get_by_product_and_warehouse()`; -
-`get_many_for_update()`.
-
-Первый метод не используется в показанном пути резервирования, но может
-пригодиться другим операциям.
-
-### 5.11 Открытый вопрос по идемпотентности
-
-Текущее поведение: если запрос с тем же `order_id` приходит с другим
-содержимым `items`, Service возвращает существующую резервацию, не
-сравнивая payload.
-
-Это предотвращает повторное создание резервации, но требует явной
-бизнес-политики. При разработке Order Service нужно решить и
-задокументировать:
-
--   **Вариант A:** `order_id` --- ключ идемпотентности, первый запрос
-    побеждает, все последующие запросы с этим `order_id` возвращают
-    исходный результат независимо от payload.
--   **Вариант B:** повтор с тем же `order_id`, но другим набором
-    товаров/количеств считается конфликтом и возвращает отдельную
-    бизнес-ошибку (например, 409).
-
-Не менять поведение без согласования с контрактом Order Service.
-
-### 5.12 Тестирование
-
-Пользователь ранее подтвердил локальный запуск: **16 passed**.
-
-Известные тестовые сценарии: - подключение к БД; - успешное создание
-резервации; - недостаточный остаток; - складская позиция не найдена; -
-идемпотентность; - нормализация дублирующихся позиций; - атомарность
-нескольких позиций; - параллельные резервации не приводят к
-overselling; - PostgreSQL row lock блокирует вторую транзакцию; -
-конкурентные запросы с одним `order_id` дают одну резервацию; - API:
-успешный ответ, повторный запрос, бизнес-ошибки, пустой список,
-некорректный UUID.
-
-Команды из `services/inventory`:
-
-``` bash
-poetry run pytest -v
-poetry run ruff check .
-poetry run ruff format --check .
-poetry check --lock
-```
-
-Автоисправление:
-
-``` bash
-poetry run ruff check . --fix
-poetry run ruff format .
-```
-
-После автоисправлений обязательно повторно выполнить проверки и
-посмотреть `git diff`.
-
-### 5.13 Poetry и зависимости
-
-Из истории проекта: - Python `>=3.14`; - Poetry `2.4.3`; - Ruff
-`0.17.3`; - FastAPI `0.162.x`; - SQLAlchemy `2.1.x` с asyncio; - asyncpg
-`0.32.x`; - Alembic `1.20.x`; - pydantic-settings `2.16.x`; -
-python-dotenv `1.2.x`; - HTTPX `0.28.x`; - pytest `9.2.x`; -
-pytest-asyncio `1.4.x`.
-
-Точные версии и диапазоны проверять в
-`services/inventory/pyproject.toml` и `poetry.lock`, а не полагаться на
-сводку. Используется `package-mode = false`.
-
-### 5.14 Docker
-
-Корневой `compose.yaml` поднимает: - `inventory-db`: PostgreSQL 17
-Alpine; - `inventory-api`: Inventory FastAPI service.
-
-Из истории: - БД: `inventory_db`; - пользователь: `inventory_user`; -
-контейнер БД: `flowops-inventory-db`; - API опубликован на порту
-`8000`; - API ожидает healthy-состояния БД; - healthcheck API использует
-`/health`; - миграции запускаются перед стартом Uvicorn; - контейнер
-приложения работает от непривилегированного пользователя `app`.
-
-Не хранить реальные секреты в репозитории. `.env` должен оставаться
-локальным и исключённым из Git; убедиться, что реальные пароли и токены
-не попали в репозиторий.
-
-### 5.15 Alembic
-
-Известна миграция:
-
-`ddfe927be72e_create_inventory_tables.py`
-
-Ранее подтверждалось: - `alembic current` показывал
-`ddfe927be72e (head)`; - миграции применялись в Docker.
-
-Не создавать новую базу/миграцию для уже существующих таблиц без
-проверки текущего состояния. Для нового микросервиса миграции должны
-быть независимыми от Inventory Service.
-
-### 5.16 GitHub Actions CI
-
-Файл: `.github/workflows/ci.yml`.
-
-CI запускается на push и pull request в `main`.
-
-Известные этапы: - checkout; - setup Python 3.14; - установка Poetry
-2.4.3; - `poetry install --with dev`; - `ruff check`; -
-`ruff format --check`; - `pytest -v` с PostgreSQL 17 service
-container; - Docker build.
-
-Ранее CI ловил Ruff import sorting ошибки в миграциях; они были
-исправлены. Пользователь сообщил, что после исправлений локальные
-проверки и GitHub Actions проходят.
-
-Текущий HEAD SHA после последнего успешного push неизвестен. Не считать
-старый SHA актуальным; при необходимости проверить `git status`,
-`git log -1 --oneline` и GitHub Actions.
-
-## 6. Итог финального аудита Inventory Service
-
-Пользователь последовательно показал исходники: -
-`ReservationService`; - `ReservationRepository`; -
-`InventoryRepository`; - endpoint `reservations.py`; - Pydantic
-`reservation.py`; - `main.py`; - модели `inventory.py`,
-`reservation.py`, `reservation_item.py`.
-
-По представленным исходникам критических архитектурных дефектов,
-блокирующих дальнейшую разработку, не выявлено.
-
-Неблокирующие наблюдения: 1. Зафиксировать политику для повторного
-`order_id` с отличающимся payload. 2. Добавить readiness endpoint с
-проверкой БД, если понадобится. 3. Убедиться, что неожиданные исключения
-логируются сервером, а клиенту не раскрываются SQL/внутренние детали. 4.
-Решить судьбу неиспользуемого `ReservationRepository.create_items()`. 5.
-При необходимости ужесточить входные Pydantic-схемы через
-`extra="forbid"`. 6. Подтверждение и освобождение резерваций пока не
-реализованы как бизнес-операции. Enum статусов уже содержит `RESERVED`,
-`CONFIRMED`, `RELEASED`. Их жизненный цикл следует проектировать вместе
-с Order Service. 7. Проверить фактическую конфигурацию unique/index для
-`order_id` в миграции прежде чем менять модель. Не делать предположений
-об индексации.
-
-**Статус:** Inventory Service завершён как самостоятельный первый этап и
-готов к интеграции. Не переписывать его и не продолжать аудит без
-конкретной причины, бага или нового требования.
-
-## 7. Следующий этап --- Order Service
-
-### 7.1 Назначение
-
-Order Service владеет заказами и их жизненным циклом. Он не владеет
-складскими остатками и не создаёт записи в Inventory DB.
-
-Базовая схема взаимодействия:
-
-``` text
-Client
-  |
-  v
-Order Service
-  |
-  | HTTP request: reserve items for order
-  v
-Inventory Service
-  |
-  v
-Inventory PostgreSQL
-
-Order Service
-  |
-  v
-Order PostgreSQL
-```
-
-Точная последовательность записи заказа и вызова Inventory Service
-должна быть спроектирована до реализации. Нельзя наивно пытаться сделать
-одну ACID-транзакцию через две независимые БД/сервиса: обычная
-SQLAlchemy-транзакция не охватывает удалённый сервис.
-
-### 7.2 Что спроектировать до кода
-
-1.  Границы ответственности Order Service.
-2.  Статусы заказа и допустимые переходы.
-3.  Модели Order и OrderItem.
-4.  Входные/выходные Pydantic-схемы.
-5.  API создания и чтения заказа.
-6.  Service и Repository.
-7.  HTTP-клиент Inventory Service (отдельный клиент/адаптер, timeout,
-    корректная обработка сетевых ошибок).
-8.  Контракт вызова Inventory Service: endpoint, payload, response,
-    статусы и ошибки.
-9.  Идемпотентность создания заказа.
-10. Поведение при отказе Inventory Service, timeout, недостатке товара и
-    повторе запроса.
-11. Компенсирующие действия/согласование состояний (например, release
-    reservation) после определения бизнес-процесса.
-12. Тесты с замоканным HTTP-клиентом и интеграционные тесты с Inventory
-    Service.
-
-### 7.3 Рекомендуемые этапы
-
-**Этап 0 --- архитектурный контракт** - определить сущности заказа и
-статусы; - определить API-контракт Order ↔ Inventory; - определить
-последовательность операций и обработку отказов; - решить политику
-идемпотентности; - записать решения в docs.
-
-**Этап 1 --- каркас сервиса** - `services/order/`; - отдельный Poetry
-project; - FastAPI application; - конфигурация; - собственная PostgreSQL
-БД; - SQLAlchemy async engine/session; - Alembic; - Dockerfile; -
-подключение в root Compose; - CI.
-
-**Этап 2 --- доменная модель и локальная логика** - Order / OrderItem; -
-enum статусов; - ограничения БД; - схемы; - repositories; - service; -
-unit/integration tests.
-
-**Этап 3 --- интеграция с Inventory** - typed HTTP client; - timeout; -
-преобразование ответов Inventory в ошибки/результаты Order; -
-тестирование успеха, недостатка остатков, отсутствующей складской
-позиции, timeout и недоступности Inventory; - повторные запросы и
-идемпотентность.
-
-**Этап 4 --- отказоустойчивость и завершение** - определить компенсацию
-при частично завершённом процессе; - логирование и correlation/request
-IDs; - health/readiness; - тесты конкуренции/повторов; - Docker/CI; -
-финальный аудит.
-
-Не реализовывать всё одним огромным изменением. Двигаться итеративно,
-проверяя каждый этап.
-
-### 7.4 Вопросы, которые нельзя решить молча
-
--   Должен ли Order сначала сохраняться в `PENDING`, а затем запрашивать
-    резервирование, или нужна другая последовательность?
--   Что делать, если Inventory зарезервировал товар, но Order Service не
-    смог сохранить финальное состояние из-за ошибки?
--   Что делать, если Order Service отправил запрос, получил timeout, но
-    Inventory успел создать резервацию?
--   Как клиент безопасно повторяет запрос создания заказа?
--   Кто и когда вызывает освобождение резервации?
--   Каковы переходы `PENDING`, `RESERVED`, `CONFIRMED`, `CANCELLED` и
-    другие? Точный набор ещё не утверждён.
--   Будет ли интеграция сначала синхронной через HTTP, а позже расширена
-    событиями RabbitMQ/Kafka?
--   Где нужен transactional outbox и на каком этапе он оправдан?
-
-Рассматривать Saga/compensation и transactional outbox по мере появления
-реальной межсервисной необходимости, а не вводить формально.
-
-## 8. Правила работы AI-наставника
-
-Пользователь хочет, чтобы AI был техническим наставником и помог довести
-проект до сильного Middle+ портфолио.
-
-Обязательные предпочтения: 1. Общаться на русском. 2. Не объяснять
-базовые конструкции FastAPI вроде `FastAPI()` и простого декоратора
-endpoint, если пользователь не просит. 3. Давать достаточно глубокие
-инженерные объяснения, но без чрезмерного разбора каждой строки. 4. По
-возможности предоставлять полный код целого файла, который пользователь
-самостоятельно переписывает и изучает. 5. Всегда указывать путь файла,
-который нужно создать/заменить. 6. После кода коротко объяснять
-назначение файла, важные решения и что пользователь должен понять. 7.
-Чётко говорить, что можно копировать, а что лучше написать/разобрать
-самостоятельно. 8. Работать небольшими последовательными этапами. Не
-выдавать сразу весь будущий микросервис. 9. Не переходить дальше, пока
-текущий шаг не понятен и не проверен. 10. Не предлагать переписывать
-готовые части без причины. 11. Если для точного изменения нужен код,
-запросить только конкретный необходимый файл/фрагмент. 12. Когда
-контекст беседы становится слишком большим, заранее предупредить и
-подготовить handoff. 13. Объяснять компромиссы и реальные последствия
-архитектурных решений, особенно транзакции, конкурентность,
-идемпотентность, HTTP retry/timeout и согласованность микросервисов. 14.
-Проект должен быть реалистичным и демонстрировать инженерные навыки, а
-не просто большое количество библиотек.
-
-## 9. Полезные команды
-
-Из корня репозитория (PowerShell):
-
-``` powershell
-tree /F /A
-git status
-git log -1 --oneline
-git add .
-git commit -m "..."
-git push
-```
-
-Из `services/inventory`:
-
-``` powershell
-poetry run ruff check .
-poetry run ruff format --check .
-poetry run pytest -v
-poetry check --lock
-```
-
-Автоисправление:
-
-``` powershell
-poetry run ruff check . --fix
-poetry run ruff format .
-```
-
-Из корня:
-
-``` powershell
-docker compose config
-docker compose up -d --build
-docker compose ps
-docker compose logs -f inventory-api
-docker compose logs -f inventory-db
-```
-
-Swagger Inventory Service при локально запущенном Compose:
-
-`http://localhost:8000/docs`
-
-Health:
-
-`http://localhost:8000/health`
-
-Не запускать destructive-команды вроде `docker compose down -v` или
-удаления volume без предупреждения: volume содержит данные PostgreSQL.
-
-## 10. Текущая точка старта
-
-На момент передачи: - FlowOps существует как Git-репозиторий. - Корневой
-Compose и GitHub Actions настроены для Inventory Service. - Inventory
-Service реализован и проверен. - Локальные тесты ранее показывали 16/16
-passed. - Ruff lint и format checks проходили. - Docker image собирался;
-контейнеры поднимались и были healthy. - Alembic миграция применялась. -
-API проверялся через Swagger; повторная резервация возвращала
-существующий результат. - Пользователь сообщил, что исправления запушены
-и GitHub Actions проходит. - Финальный аудит не выявил блокирующих
-дефектов. - Следующий шаг --- спроектировать Order Service и контракт
-его взаимодействия с Inventory Service.
-
-Не считать известными: актуальный commit SHA, текущее содержимое каждого
-файла после последних изменений, наличие незакоммиченных изменений,
-актуальные секреты и фактический статус контейнеров в момент чтения.
-Проверять это командами Git/Docker при необходимости.
-
-## 11. Инструкция для первого ответа после передачи
-
-Не начинай генерировать код Order Service сразу.
-
-Сначала: 1. Кратко подтверди, что понял идею FlowOps и текущее
-состояние. 2. Зафиксируй, что Inventory Service завершён и его не нужно
-переписывать. 3. Назови следующий этап --- архитектурное проектирование
-Order Service. 4. Предложи начать с согласования бизнес-потока создания
-заказа и контракта Order ↔ Inventory. 5. Задавай только один
-действительно необходимый вопрос за раз. 6. Не повторяй пользователю всю
-документацию и не начинай с базового объяснения FastAPI.
-
-**Итог:** FlowOps --- единая система, а не коллекция несвязанных
-сервисов. Inventory Service --- завершённый первый микросервис и
-владелец складских резервов. Продолжать нужно с Order Service, сохраняя
-принятые границы сервисов и инженерные решения.
+    ``` yaml
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    ```
+
+    При переходе к Nginx/балансировке пересмотреть в сторону стратегии
+    B: отдельный one-off `identity-migrate` +
+    `depends_on: service_completed_successfully`.
+
+4.  **Не менять архитектурные решения молча.** Если обнаружена проблема,
+    объяснить её и предложить варианты до изменения.
+
+5.  **Работать небольшими шагами.** Не переходить дальше, пока текущий
+    шаг не реализован и не проверен.
+
+6.  **Предупреждать о росте контекста.** Если переписка разрастается,
+    заранее предупредить и подготовить handoff.
+
+7.  **Inventory не переписывать** без конкретной причины, бага или
+    нового требования.
+
+8.  **Секреты не коммитить.** `.env` локальный и находится в
+    `.gitignore`. В Git хранится только `.env.example`. JWT-ключи ---
+    локально в `.env`, в GitHub Secrets для CI или Docker secrets в
+    production.
+
+------------------------------------------------------------------------
+
+## 6. План Identity: шаги 2--5
+
+### Шаг 2 --- модели и миграция
+
+- Создать `app/models/user.py`, `refresh_token.py`, `login_attempt.py`
+  по согласованным схемам выше.
+
+- Заполнить `app/models/__init__.py` импортами всех трёх моделей --- это
+  нужно для Alembic autogenerate и `from app import models` в
+  `migrations/env.py`.
+
+- Для роли использовать PostgreSQL Enum:
+  `sa.Enum(..., name="user_role")` или `native_enum=True` (конкретный
+  способ выбрать при реализации Шага 2).
+
+- Выполнить:
+
+  ``` powershell
+  poetry run alembic revision --autogenerate -m "create identity tables"
+  ```
+
+- Проверить, что миграция содержит:
+
+  - `users` (unique index на email, Enum/check constraint для role);
+  - `refresh_tokens` (FK и index);
+  - `login_attempts` (nullable FK и composite index
+    `(email, created_at)`).
+
+- Применить и проверить миграцию:
+
+  ``` powershell
+  poetry run alembic upgrade head
+  poetry run alembic downgrade -1
+  poetry run alembic upgrade head
+  ```
+
+- Проверить создание таблиц, работу FK и наличие индексов.
+
+- Внедрить стратегию A в `compose.yaml`: запуск Alembic перед Uvicorn.
+
+### Шаг 3 --- безопасность
+
+- Добавить зависимости: `argon2-cffi`, `pyjwt`, `cryptography`.
+- После изменения `pyproject.toml` выполнить `poetry lock` и закоммитить
+  оба файла.
+- Создать `app/core/security.py`:
+  - `hash_password` / `verify_password` (Argon2id);
+  - `create_access_token` / `create_refresh_token` (RS256, `kid`);
+  - `decode_token` (проверка подписи и типа);
+  - `load_private_key` / `load_public_key`.
+- Подготовить генерацию ключей для разработки: скрипт или инструкция в
+  README, например `scripts/gen_keys.py`.
+- Ключи хранить в `services/identity/keys/`, добавить эту папку в
+  `.gitignore`.
+- Проверить unit-тестами:
+  - хеширование: round-trip и неверный пароль;
+  - JWT: encode/decode, expiry, wrong `kid`, wrong type.
+
+### Шаг 4 --- схемы, репозитории, сервис, эндпоинты и зависимости
+
+- Схемы: `app/schemas/auth.py`, `app/schemas/user.py`.
+- Репозитории: `app/repositories/user.py`, `refresh_token.py`,
+  `login_attempt.py`.
+- Сервисный слой:
+  - `app/services/auth.py` --- register, login, refresh с ротацией и
+    отзывом цепочки, logout;
+  - `app/services/user.py` --- get/list.
+- `app/api/deps.py`:
+  - `get_current_user` --- Bearer access, проверка `type=access`,
+    загрузка пользователя из БД;
+  - `require_admin`.
+- Эндпоинты: `app/api/v1/endpoints/auth.py`, `users.py`; подключить их в
+  `router.py`.
+- Обработка ошибок: `401`, `403`, `409`, `422`, без утечки внутренних
+  деталей.
+- Проверить через Swagger и ручной прогон:
+  `register → login → refresh → logout → me`.
+- Повторное использование уже использованного refresh должно приводить к
+  `401` и отзыву цепочки.
+
+### Шаг 5 --- тесты и финализация
+
+- Создать `services/identity/tests/`.
+- Написать минимум 10 тестов (unit + integration).
+- Использовать моки внешних зависимостей и фикстуры для БД, клиента,
+  пользователей `admin`/`user`.
+- Добавить `pytest -v` в CI job `identity`.
+- Обновить handoff после завершения этапа.
+
+------------------------------------------------------------------------
+
+## 7. Открытые вопросы на будущее (не блокируют текущий Шаг 2)
+
+- `/ready` с проверкой БД --- определить подходящий момент внедрения.
+- JWKS endpoint и ротация `kid` --- определить подходящий момент.
+- Проверка JWT в каждом сервисе или общий внутренний пакет --- решить
+  при появлении второго сервиса, которому понадобится проверка токенов.
+- Контракт Order ↔ Inventory: endpoint, payload, события, timeout/отказ,
+  идемпотентность создания заказа, компенсация/release reservation.
+- Transactional outbox в Order: схема, публикация, retry/DLQ.
+- Стратегия миграций B (one-off `identity-migrate`) --- при переходе к
+  Nginx.
+
+------------------------------------------------------------------------
+
+## 8. Текущая точка старта
+
+- **Шаг 1 Identity закрыт:** каркас, БД, Alembic, Docker и CI работают.
+- **Следующий шаг --- Шаг 2 Identity:** модели `User` / `RefreshToken` /
+  `LoginAttempt`, первая настоящая миграция и внедрение стратегии A в
+  `compose.yaml`.
+- **Inventory не трогать.**
+- Перед началом Шага 2 согласовать с пользователем план из раздела 6,
+  затем выдавать код частями: модели → миграция → проверка.
