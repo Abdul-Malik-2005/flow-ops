@@ -1,6 +1,6 @@
 # FlowOps — техническая передача проекта (Handoff)
 
-**Актуально на:** Шаг 3 Identity Service, части A и B закрыты (безопасность + тесты безопасности); Часть C (CI + Docker-сборка) — следующий шаг.
+**Актуально на:** Шаг 3 Identity Service — **ЗАКРЫТ** (части A, B, C: безопасность, тесты безопасности, CI + Docker-сборка). Следующий — Шаг 4.
 **Репозиторий:** https://github.com/Abdul-Malik-2005/flow-ops
 **Наставник:** senior Python Backend архитектор. Общение на русском, уровень Middle+, без базовых объяснений FastAPI. Работать небольшими этапами, не переходить к следующему, пока текущий не проверен. Давать полный код файла с точным путём. Не менять архитектурные решения молча. **Предлагать не «проще», а надёжнее** — с учётом корректности при сбоях, совместимости миграций, безопасности, предсказуемости в проде.
 
@@ -38,7 +38,7 @@ transactional outbox).
   status), `ReservationItem` (FK cascade, composite FK).
 - Не переписывать без конкретной причины/бага/нового требования.
 
-### Identity Service — ШАГИ 1 И 2 ЗАКРЫТЫ, ШАГ 3 (A + B) ЗАКРЫТ
+### Identity Service — ШАГИ 1, 2, 3 ЗАКРЫТЫ
 
 **Шаг 1 — каркас (закрыт):**
 
@@ -170,17 +170,34 @@ transactional outbox).
   падал `FileNotFoundError` — забыл `jwt_keys`.
 - Коммит `identity: security tests — argon2id + jwt (step 3, part B)`.
 
-**Ещё не сделано (Шаг 3, часть C; Шаги 4–5):**
+**Шаг 3, часть C — CI + Docker-сборка (ЗАКРЫТА):**
 
-- **Шаг 3, часть C:** CI job `identity` — добавить `pytest -v` (сейчас
-  только `ruff format --check` + `ruff check` + `docker build`);
-  проверить `docker compose build identity-api` с новыми зависимостями
-  (argon2-cffi, pyjwt, cryptography) — образ собирается; обновить handoff.
+- CI job `identity`: добавлен шаг `poetry run pytest -v` (после `ruff check`,
+  перед `docker build`).
+- Добавлены `timeout-minutes: 15`, `concurrency` с `cancel-in-progress`,
+  `permissions: contents: read` — senior-пractice для надёжного CI.
+- `docker compose build identity-api` — образ собирается с argon2-cffi,
+  pyjwt, cryptography (abi3-колёса, компилятор не нужен).
+- `docker compose up -d identity-db identity-api` — контейнеры healthy,
+  миграция применяется при старте, `/health` → `{"status":"healthy"}`.
+- **Правки безопасности в `security.py` (в рамках части C):**
+  - Импорт `Type` из `argon2` вместо `__import__` хака.
+  - `verify_password` ловит `VerificationError` (базовый класс) вместо
+    конкретных исключений — гарантия «никогда не бросает», 500 на `/login`
+    исключён.
+- Коммит `identity: ci — pytest in identity job, security fixes (step 3, part C)`.
+
+**Следующие шаги (4–5):**
+
 - **Шаг 4:** схемы, репозитории, сервисный слой, `get_current_user`,
   `require_admin`, эндпоинты (`/auth/register`, `/auth/login`,
   `/auth/refresh`, `/auth/logout`, `/auth/me`, `/users`).
 - **Шаг 5:** тесты бизнес-логики (register/login/refresh/logout/me —
-  unit + integration), минимум 10 помимо 13 тестов безопасности.
+  unit + integration), минимум 10 помимо тестов безопасности.
+- **Задача на старт Шага 4 (из разбора кода):** JWT-ключи через Docker secrets
+  + fail-fast в `lifespan` (вызов `_private_key()`/`_public_key()` при старте).
+  Сейчас сервис стартует без ключей (ленивая загрузка), но `/login` упадёт
+  с 500. Профессиональный подход: secrets в compose, проверка при запуске.
 - `/ready` с проверкой БД — открытый вопрос, не блокирует.
 - Метрики Prometheus, Redis-кэш, Nginx — по мере появления остальных сервисов.
 
@@ -553,26 +570,29 @@ http://localhost:8000/health, http://localhost:8001/health.
 миграция 57bb9f3333c4, strategy A в compose, цикл
 upgrade/downgrade/upgrade чистый, коммит сделан.
 
-Шаг 3 Identity, части A и B закрыты:
+**Шаг 3 Identity — ЗАКРЫТ (части A, B, C):**
 
-часть A: app/core/security.py (Argon2id + RS256 JWT + загрузка
-ключей), scripts/gen_keys.py, keys/ в .gitignore, pyproject.toml
+- **часть A:** `app/core/security.py` (Argon2id + RS256 JWT + загрузка
+  ключей), `scripts/gen_keys.py`, `keys/` в `.gitignore`, `pyproject.toml`
+  + `poetry.lock` с новыми зависимостями; коммит `identity: security — argon2id, RS256 keys, jwt (step 3, part A)`.
+- **часть B:** `tests/conftest.py` (env до импорта `app.*`, фикстура
+  `jwt_keys` с `lru_cache.clear()`), `tests/test_security.py` — 13 тестов,
+  все passed; коммит `identity: security tests — argon2id + jwt (step 3, part B)`.
+- **часть C:** CI job `identity` — `pytest -v`, `timeout-minutes`, `concurrency`,
+  `permissions`; `docker compose build/up` — образ собирается, контейнеры healthy,
+  миграция применяется при старте; правки безопасности в `security.py` (импорт `Type`,
+  ловля `VerificationError`); коммит `identity: ci — pytest in identity job, security fixes (step 3, part C)`.
 
-poetry.lock с новыми зависимостями; коммит identity: security — argon2id, RS256 keys, jwt (step 3, part A);
-
-часть B: tests/conftest.py (env до импорта app.*, фикстура
-jwt_keys с lru_cache.clear()), tests/test_security.py — 13 тестов,
-все passed; коммит identity: security tests — argon2id + jwt (step 3, part B).
-
-Следующий шаг — Шаг 3, часть C: добавить pytest -v в job identity
-в .github/workflows/ci.yml; проверить docker compose build identity-api
-с новыми зависимостями; обновить handoff (Шаг 3 закрыт). См. раздел 6.
+**Следующий — Шаг 4:** схемы, репозитории, сервис, эндпоинты.
 
 Inventory не трогать.
 
-Перед началом Шага 4 (схемы/репозитории/сервис/эндпоинты) — согласовать
-план и решения (формы Pydantic, обработка ошибок, стратегия ротации
-refresh, отзыв цепочки, rate limiting на login — последнее опционально).
+**Перед началом Шага 4 — согласовать решения:**
+
+1. JWT-ключи через Docker secrets + fail-fast в `lifespan` (задача из части C).
+2. Формы Pydantic, обработка ошибок (401/403/409/422 без утечек).
+3. Стратегия ротации refresh + отзыв цепочки при повторном использовании.
+4. Rate limiting на `/auth/login` — опционально (Redis появится позже).
 
 10. Инструкция для первого ответа после передачи
 Кратко подтверди понимание идеи FlowOps и текущего статуса
