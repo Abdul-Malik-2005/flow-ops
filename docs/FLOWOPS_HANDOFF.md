@@ -1,6 +1,6 @@
 # FlowOps — техническая передача проекта (Handoff)
 
-**Актуально на:** конец Шага 2 Identity Service (модели + миграция + strategy A в Docker).
+**Актуально на:** Шаг 3 Identity Service, части A и B закрыты (безопасность + тесты безопасности); Часть C (CI + Docker-сборка) — следующий шаг.
 **Репозиторий:** https://github.com/Abdul-Malik-2005/flow-ops
 **Наставник:** senior Python Backend архитектор. Общение на русском, уровень Middle+, без базовых объяснений FastAPI. Работать небольшими этапами, не переходить к следующему, пока текущий не проверен. Давать полный код файла с точным путём. Не менять архитектурные решения молча. **Предлагать не «проще», а надёжнее** — с учётом корректности при сбоях, совместимости миграций, безопасности, предсказуемости в проде.
 
@@ -14,9 +14,9 @@ FlowOps — портфолио-проект Middle+ Python Backend: микрос
 
 **Стек:** Python 3.14+, FastAPI, Pydantic/pydantic-settings, PostgreSQL 17,
 SQLAlchemy 2.x async, asyncpg, Alembic, Poetry 2.4.3, Docker/Compose,
-pytest/pytest-asyncio, Ruff, HTTPX. RabbitMQ/Redis/Nginx/Prometheus — по мере
-появления сервисов, не все внедрены. Kafka/K8s/Service Mesh не нужны.
-Saga/CQRS не обязательны.
+pytest/pytest-asyncio, Ruff, HTTPX, argon2-cffi, pyjwt, cryptography.
+RabbitMQ/Redis/Nginx/Prometheus — по мере появления сервисов, не все внедрены.
+Kafka/K8s/Service Mesh не нужны. Saga/CQRS не обязательны.
 
 **Порядок реализации:** Inventory (завершён) → Identity → Order → Catalog →
 Payment → Notification. Order — вариант Б (async-оркестрация через RabbitMQ +
@@ -38,7 +38,7 @@ transactional outbox).
   status), `ReservationItem` (FK cascade, composite FK).
 - Не переписывать без конкретной причины/бага/нового требования.
 
-### Identity Service — ШАГИ 1 И 2 ЗАКРЫТЫ
+### Identity Service — ШАГИ 1 И 2 ЗАКРЫТЫ, ШАГ 3 (A + B) ЗАКРЫТ
 
 **Шаг 1 — каркас (закрыт):**
 
@@ -49,10 +49,9 @@ transactional outbox).
   `.gitignore`.
 - `app/core/config.py` — `Settings(BaseSettings)` с полями:
   `database_url`, `test_database_url`, `debug`, `environment`,
-  **JWT-заготовки** (`jwt_algorithm="RS256"`, `jwt_kid="identity-1"`,
+  JWT-поля (`jwt_algorithm="RS256"`, `jwt_kid="identity-1"`,
   `jwt_private_key_path=""`, `jwt_public_key_path=""`,
   `access_token_ttl_seconds=900`, `refresh_token_ttl_seconds=2592000`).
-  JWT-поля используются начиная с Шага 3.
 - `app/db/base.py` — `Base(DeclarativeBase)`.
 - `app/db/session.py` — `create_async_engine(pool_pre_ping=True)`,
   `async_sessionmaker(expire_on_commit=False)`, `get_session()`.
@@ -74,7 +73,8 @@ transactional outbox).
 - CI (`.github/workflows/ci.yml`): workflow `CI`, два параллельных job —
   `inventory` и `identity` (`poetry install --with dev`,
   `ruff format --check`, `ruff check`, `docker build -t flowops-identity:ci .`).
-  Pytest в job `identity` — на Шаге 5.
+  Pytest в job `identity` — добавляется на Шаге 3, часть C (тесты
+  безопасности уже есть — 13 passed локально).
 
 **Шаг 2 — модели + миграция + strategy A (закрыт):**
 
@@ -107,6 +107,83 @@ transactional outbox).
   оба `/health` отвечают; миграция применяется при старте `identity-api`;
   коммит `identity: models + initial migration (step 2)` сделан.
 
+**Шаг 3, часть A — безопасность (закрыта):**
+
+- Зависимости добавлены в `pyproject.toml` → `poetry.lock`:
+  `argon2-cffi (~25.1)`, `pyjwt (~2.10)`, `cryptography (~46.0)`.
+- `scripts/gen_keys.py` — генерация RSA 2048 PEM:
+  `keys/jwt_private.pem` (PKCS#8, без пароля) + `keys/jwt_public.pem`
+  (SubjectPublicKeyInfo). Отказывается перезаписывать без `--force`.
+  `keys/` добавлен в `.gitignore`.
+- `.env.example` и локальный `.env`: пути
+  `JWT_PRIVATE_KEY_PATH=./keys/jwt_private.pem`,
+  `JWT_PUBLIC_KEY_PATH=./keys/jwt_public.pem`, `JWT_ALGORITHM=RS256`,
+  `JWT_KID=identity-1`, `ACCESS_TOKEN_TTL_SECONDS=900`,
+  `REFRESH_TOKEN_TTL_SECONDS=2592000`.
+- `app/core/security.py`:
+  - Argon2id (`PasswordHasher`, t=3, m=64 MiB, p=4, hash_len=32, salt_len=16,
+    `type=Type.ID` — OWASP-параметры, зафиксированы явно);
+  - `hash_password` / `verify_password` (ловит `VerifyMismatchError` и
+    `InvalidHashError`, возврат `False`, не бросает);
+  - `_private_key()` / `_public_key()` — `lru_cache(maxsize=1)`,
+    `Path(...).resolve()`, `FileNotFoundError` с понятным сообщением
+    («запусти `scripts/gen_keys.py`»);
+  - `create_access_token(sub: UUID, role: UserRole)` — claims
+    `sub, role, type="access", iat, exp, jti`; `kid` в **header**;
+  - `create_refresh_token(sub: UUID, jti: UUID)` — claims
+    `sub, type="refresh", iat, exp, jti`; **без role**; `jti` передаётся
+    извне (сервис на Шаге 4 запишет тот же `jti` в БД до `INSERT`);
+  - `decode_token(token, expected_type: Literal["access","refresh"])` —
+    проверка подписи RS256, `options={"require": ["exp","iat","sub","type","jti"]}`,
+    проверка `type == expected_type`, бросает `InvalidTokenError` (собственное
+    исключение, не `jwt.InvalidTokenError`);
+  - `algorithms=[settings.jwt_algorithm]` явно — защита от `alg=none` и
+    подмены RS256→HS256;
+  - `iat`/`exp` — `datetime.now(UTC)`, не `utcnow()`.
+- Проверено: импорт `security` без ключей (ключи нужны только при первом
+  вызове `_private_key`), smoke-тесты argon2 round-trip и JWT encode/decode,
+  `ruff check` и `ruff format --check` чисто.
+- Коммит `identity: security — argon2id, RS256 keys, jwt (step 3, part A)`.
+
+**Шаг 3, часть B — тесты безопасности (закрыта):**
+
+- `tests/__init__.py` — пустой пакет.
+- `tests/conftest.py`:
+  - `os.environ.setdefault("DATABASE_URL", ...)` **до** импорта `app.*`
+    (иначе `Settings()` падает `ValidationError` при `pytest`, когда `.env`
+    не найден в cwd; в CI `.env` нет вообще);
+  - `DATABASE_URL`, `DEBUG`, `ENVIRONMENT` — фиктивные значения для тестов;
+  - фикстура `jwt_keys(tmp_path, monkeypatch)` — генерирует RSA 2048 в
+    `tmp_path`, подменяет `settings.jwt_private_key_path` /
+    `settings.jwt_public_key_path`, делает `security._private_key.cache_clear()`
+    и `security._public_key.cache_clear()` **до и после** теста (иначе
+    `lru_cache` на процесс подтянет ключ предыдущего теста);
+  - фикстуры `user_id`, `refresh_jti`, `access_token`, `refresh_token`.
+- `tests/test_security.py` — **13 тестов** (все passed):
+  argon2 round-trip, wrong password, malformed hash, salted (два хеша
+  одного пароля разные); access claims, `kid`/`alg` в header; refresh
+  claims без role; type mismatch (refresh↔access); подпись чужим ключом;
+  мусорный токен; истёкший токен; отсутствующий обязательный claim.
+- Урок: тест, вызывающий `decode_token`/`create_*_token`/`_private_key`/
+  `_public_key`, **обязан** иметь `jwt_keys` в сигнатуре (явно или
+  транзитивно через фикстуру-токен). `test_garbage_token_is_rejected` сначала
+  падал `FileNotFoundError` — забыл `jwt_keys`.
+- Коммит `identity: security tests — argon2id + jwt (step 3, part B)`.
+
+**Ещё не сделано (Шаг 3, часть C; Шаги 4–5):**
+
+- **Шаг 3, часть C:** CI job `identity` — добавить `pytest -v` (сейчас
+  только `ruff format --check` + `ruff check` + `docker build`);
+  проверить `docker compose build identity-api` с новыми зависимостями
+  (argon2-cffi, pyjwt, cryptography) — образ собирается; обновить handoff.
+- **Шаг 4:** схемы, репозитории, сервисный слой, `get_current_user`,
+  `require_admin`, эндпоинты (`/auth/register`, `/auth/login`,
+  `/auth/refresh`, `/auth/logout`, `/auth/me`, `/users`).
+- **Шаг 5:** тесты бизнес-логики (register/login/refresh/logout/me —
+  unit + integration), минимум 10 помимо 13 тестов безопасности.
+- `/ready` с проверкой БД — открытый вопрос, не блокирует.
+- Метрики Prometheus, Redis-кэш, Nginx — по мере появления остальных сервисов.
+
 **Известные особенности (не баги):**
 
 - `sa.Enum` по умолчанию сохраняет `.name` членов Python-enum (`'ADMIN'`), а
@@ -122,15 +199,19 @@ transactional outbox).
 - Alembic `autogenerate` иногда не видит модели, если `migrations/env.py`
   пуст/не импортирует `models` — проверять `Base.metadata.tables.keys()`
   после добавления моделей.
-
-**Ещё не сделано (Шаги 3–5):**
-
-- Безопасность: Argon2id, JWT (RS256), ключи, `get_current_user`, роли.
-- Схемы, репозитории, сервисный слой, эндпоинты (`/auth/register`,
-  `/auth/login`, `/auth/refresh`, `/auth/logout`, `/auth/me`, `/users`).
-- Тесты (минимум 10: unit + integration).
-- `/ready` с проверкой БД — открытый вопрос, не блокирует.
-- Метрики Prometheus, Redis-кэш, Nginx — по мере появления остальных сервисов.
+- `pydantic-settings` резолвит `env_file=".env"` от cwd процесса, не от
+  расположения `config.py`. Если `pytest` запущен из корня репозитория
+  (или `.env` нет в cwd), `Settings()` падает `ValidationError: database_url
+  Field required`. Фикс: `os.environ.setdefault(...)` **до** импорта `app.*`
+  в `tests/conftest.py`.
+- Ruff `UP017` требует `datetime.UTC` вместо `timezone.utc` (Python 3.11+).
+  В `security.py` — `from datetime import UTC, datetime, timedelta` и
+  `datetime.now(UTC)`.
+- `ruff format check` (без `--`) — не команда. Правильно:
+  `ruff format --check .` (флаг `--check`, не подкоманда `check`).
+- `lru_cache` на `_private_key`/`_public_key` кеширует ключ **на процесс**.
+  В тестах — `cache_clear()` до и после фикстуры `jwt_keys`, иначе второй
+  тест увидит ключ первого.
 
 ---
 
@@ -254,11 +335,16 @@ flow_ops/
 ├── .dockerignore
 ├── .env # локальный, в .gitignore
 ├── .env.example
-├── .gitignore
+├── .gitignore # + keys/
 ├── alembic.ini
 ├── Dockerfile # ENV POETRY_VERSION=2.4.3
 ├── poetry.lock # сгенерирован Poetry 2.4.3
 ├── pyproject.toml # + [tool.ruff] extend-exclude = ["migrations/versions"]
+├── keys/ # локальные PEM-ключи, в .gitignore
+│ ├── jwt_private.pem
+│ └── jwt_public.pem
+├── scripts/
+│ └── gen_keys.py
 ├── migrations/
 │ ├── env.py
 │ ├── README
@@ -274,7 +360,8 @@ flow_ops/
 │ │ └── router.py
 │ ├── core/
 │ │ ├── init.py
-│ │ └── config.py
+│ │ ├── config.py
+│ │ └── security.py
 │ ├── db/
 │ │ ├── init.py
 │ │ ├── base.py
@@ -290,7 +377,10 @@ flow_ops/
 │ │ └── init.py
 │ └── services/
 │ └── init.py
-└── tests/ # появится на Шаге 5
+└── tests/
+├── init.py
+├── conftest.py
+└── test_security.py
 
 text
 
@@ -324,9 +414,9 @@ text
 7. **Inventory не переписывать** без конкретной причины/бага/нового требования.
 8. **Секреты не коммитить.** `.env` локальный, в `.gitignore`. В Git только
    `.env.example`. JWT-ключи — локально в `.env`, в GitHub Secrets для CI,
-   Docker secrets в production.
+   Docker secrets в production. `keys/` — в `.gitignore`.
 9. **`ruff check .`** — обязателен в каждом сервисе и в CI.
-   `ruff format --check` — по мере готовности файлов (для Identity включён
+   `ruff format --check .` — по мере готовности файлов (для Identity включён
    в CI сразу; `migrations/versions/` исключён из ruff через `extend-exclude`).
 10. **Не использовать destructive-команды** (`docker compose down -v`,
     удаление volumes) без предупреждения — volumes содержат данные PostgreSQL.
@@ -341,31 +431,36 @@ text
     миграций (upgrade/downgrade), безопасность (утечки, enumeration, timing),
     предсказуемость в проде. Если «простое» и «надёжное» расходятся —
     объяснить трейд-офф и рекомендовать надёжное.
+13. **Тесты — часть шага, а не отдельный Шаг 5.** Если на шаге появился код,
+    который можно проверить unit-тестом (безопасность, схемы, сервисы) —
+    тесты пишутся **на этом же шаге**. Шаг 5 — только интеграционные тесты
+    и финализация.
 
 ---
 
-## 6. План Identity: Шаги 3–5
+## 6. План Identity: Шаги 3 (часть C), 4, 5
 
-### Шаг 2 — модели + миграция + strategy A — ЗАКРЫТ
+### Шаг 3, часть A — безопасность — ЗАКРЫТА
 
-См. раздел 2 (Identity, Шаг 2). Реализовано, проверено, закоммичено.
+См. раздел 2 (Identity, Шаг 3, часть A). Реализовано, проверено, закоммичено.
 
-### Шаг 3 — безопасность (СЛЕДУЮЩИЙ)
+### Шаг 3, часть B — тесты безопасности — ЗАКРЫТА
 
-- Зависимости: `argon2-cffi`, `pyjwt`, `cryptography` → `poetry lock` → коммит.
-- `app/core/security.py`:
-  - `hash_password` / `verify_password` (Argon2id);
-  - `load_private_key` / `load_public_key` (RS256, пути из `Settings`);
-  - `create_access_token(sub, role, kid)` → `{sub, role, type="access", exp,
-    iat, jti, kid}`;
-  - `create_refresh_token(sub, jti, kid)` → `{sub, type="refresh", exp, iat,
-    jti, kid}` (без role);
-  - `decode_token(token, expected_type)` — проверка подписи, exp, type;
-    возврат payload или исключение.
-- Генерация ключей (dev): скрипт/инструкция, ключи в
-  `services/identity/keys/` (в `.gitignore`).
-- **Проверка:** unit-тесты (argon2 round-trip, wrong password; JWT
-  encode/decode, expiry, wrong kid, wrong type). Пока без эндпоинтов.
+См. раздел 2 (Identity, Шаг 3, часть B). 13 тестов passed, закоммичено.
+
+### Шаг 3, часть C — CI + Docker-сборка (СЛЕДУЮЩАЯ)
+
+- `.github/workflows/ci.yml`, job `identity`: добавить шаг
+  `- name: Run tests` / `run: poetry run pytest -v` между `ruff` и
+  `docker build` (по образцу job `inventory`). Плюс `ruff format --check .`
+  и `ruff check .` уже есть.
+- Проверить `docker compose build identity-api` — образ собирается с
+  `argon2-cffi`, `pyjwt`, `cryptography`; `poetry.lock` консистентен
+  (Poetry 2.4.3 в Dockerfile = локальная версия).
+- Опционально: поднять `identity-db` + `identity-api`, проверить, что
+  миграция применяется при старте (не должно быть регрессий от Шага 2).
+- Коммит `identity: ci — pytest in identity job (step 3, part C)`.
+- Обновить handoff (Шаг 3 закрыт).
 
 ### Шаг 4 — схемы, репозитории, сервис, эндпоинты, зависимости
 
@@ -379,12 +474,15 @@ text
 - Обработка ошибок: 401/403/409/422, без утечки внутренних деталей.
 - **Проверка:** Swagger, ручной прогон register→login→refresh→logout→me,
   повторный refresh с использованным токеном → 401 + отзыв цепочки.
+- Тесты на схемы/сервисы/эндпоинты — часть Шага 4 (unit + integration
+  с моками). Шаг 5 — только оставшиеся интеграционные и финализация.
 
 ### Шаг 5 — тесты + финализация
 
-- `services/identity/tests/` — минимум 10 тестов (unit + integration), моки,
-  фикстуры (БД, клиент, admin/user).
-- CI job `identity`: добавить `pytest -v`.
+- `services/identity/tests/` — минимум 10 тестов помимо 13 тестов
+  безопасности (unit + integration).
+- CI job `identity`: убедиться, что `pytest -v` зелёный (добавлен на
+  Шаге 3, часть C).
 - Обновить handoff.
 
 ---
@@ -398,6 +496,8 @@ text
   идемпотентность создания заказа, компенсация/release reservation).
 - Transactional outbox в Order: схема, публикация, retry/DLQ.
 - Стратегия миграций B (one-off `identity-migrate`) — при переходе к Nginx.
+- Rate limiting на `/auth/login` (Redis, скользящее окно или token bucket) —
+  когда появится Redis; сейчас `LoginAttempt` пишется, но не блокирует.
 - В Inventory: политика повторного `order_id` с отличающимся payload
   (вариант A — первый побеждает, вариант B — 409). Не менять без контракта
   Order.
@@ -422,11 +522,9 @@ docker compose up -d --build
 docker compose ps
 docker compose logs -f identity-api
 docker compose logs -f inventory-api
-```
-
 Из services/identity:
 
-```powershell
+powershell
 poetry install
 poetry lock
 poetry run ruff check .
@@ -437,32 +535,62 @@ poetry run alembic current
 poetry run alembic upgrade head
 poetry run alembic downgrade -1
 poetry run alembic revision --autogenerate -m "message"
-poetry run pytest -v   # после Шага 5
+poetry run pytest -v
+poetry run pytest tests/test_security.py -v
+poetry run python scripts/gen_keys.py
+poetry run python scripts/gen_keys.py --force
 poetry check --lock
-```
 Из services/inventory — аналогично (см. предыдущую версию handoff).
 
 Swagger: http://localhost:8000/docs (Inventory),
 http://localhost:8001/docs (Identity). Health:
 http://localhost:8000/health, http://localhost:8001/health.
 
+9. Текущая точка старта
+Шаг 1 Identity закрыт: каркас, БД, Alembic, Docker, CI — зелёные.
 
-## 9. Текущая точка старта
+Шаг 2 Identity закрыт: модели User/RefreshToken/LoginAttempt,
+миграция 57bb9f3333c4, strategy A в compose, цикл
+upgrade/downgrade/upgrade чистый, коммит сделан.
 
-- **Шаг 1 Identity закрыт:** каркас, БД, Alembic, Docker, CI — зелёные.
-- **Шаг 2 Identity закрыт:** модели `User` / `RefreshToken` / `LoginAttempt`, миграция `57bb9f3333c4`, strategy A в compose, цикл `upgrade/downgrade/upgrade` чистый, коммит сделан.
-- **Следующий шаг — Шаг 3 Identity:** безопасность (Argon2id, RS256-ключи, выпуск/проверка JWT). См. раздел 6.
-- **Inventory не трогать.**
-- **До начала кода по Шагу 3:** согласовать план (раздел 6) и ключевые решения (параметры Argon2, формат ключей PEM, хранение dev-ключей, тестирование в CI без реальных ключей).
+Шаг 3 Identity, части A и B закрыты:
 
----
+часть A: app/core/security.py (Argon2id + RS256 JWT + загрузка
+ключей), scripts/gen_keys.py, keys/ в .gitignore, pyproject.toml
 
-## 10. Инструкция для первого ответа после передачи
+poetry.lock с новыми зависимостями; коммит identity: security — argon2id, RS256 keys, jwt (step 3, part A);
 
-1. Кратко подтверди понимание идеи **FlowOps** и текущего статуса (**Inventory** готов, по **Identity** закрыты Шаги 1 и 2).
-2. Зафиксируй правило, что **Inventory** не переписывается и не затрагивается.
-3. Обозначь следующий этап — **Шаг 3 Identity** (безопасность: Argon2id, RS256, JWT).
-4. Предложи начать с согласования плана Шага 3 (раздел 6) и принятия архитектурных решений до написания кода (параметры Argon2, формат PEM-ключей, расположение dev-ключей, генерация/моки ключей для CI).
-5. Задавай строго **один** действительно необходимый вопрос за раз.
-6. Не пересказывай всю документацию и не давай базовых вводных по FastAPI.
-7. Следи за объёмом контекста: если диалог начнёт разрастаться — предупреди заранее и подготовь обновлённый handoff-файл.
+часть B: tests/conftest.py (env до импорта app.*, фикстура
+jwt_keys с lru_cache.clear()), tests/test_security.py — 13 тестов,
+все passed; коммит identity: security tests — argon2id + jwt (step 3, part B).
+
+Следующий шаг — Шаг 3, часть C: добавить pytest -v в job identity
+в .github/workflows/ci.yml; проверить docker compose build identity-api
+с новыми зависимостями; обновить handoff (Шаг 3 закрыт). См. раздел 6.
+
+Inventory не трогать.
+
+Перед началом Шага 4 (схемы/репозитории/сервис/эндпоинты) — согласовать
+план и решения (формы Pydantic, обработка ошибок, стратегия ротации
+refresh, отзыв цепочки, rate limiting на login — последнее опционально).
+
+10. Инструкция для первого ответа после передачи
+Кратко подтверди понимание идеи FlowOps и текущего статуса
+(Inventory готов; Identity — Шаги 1 и 2 закрыты, Шаг 3 части A и B
+закрыты, часть C — следующий шаг).
+
+Зафиксируй правило, что Inventory не переписывается и не затрагивается.
+
+Обозначь следующий этап — Шаг 3, часть C Identity: pytest -v в CI
+job identity, проверка docker compose build identity-api с новыми
+зависимостями, обновление handoff.
+
+Предложи начать с согласования плана части C (раздел 6) и проверки,
+что локальные тесты (13) и ruff зелёные перед правкой ci.yml.
+
+Задавай строго один действительно необходимый вопрос за раз.
+
+Не пересказывай всю документацию и не давай базовых вводных по FastAPI.
+
+Следи за объёмом контекста: если диалог начнёт разрастаться — предупреди
+заранее и подготовь обновлённый handoff-файл.

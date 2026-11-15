@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any, Literal
 
 import jwt
-from argon2 import PasswordHasher
-from argon2.exceptions import InvalidHashError, VerifyMismatchError
+from argon2 import PasswordHasher, Type
+from argon2.exceptions import InvalidHashError, VerificationError
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.rsa import (
     RSAPrivateKey,
@@ -32,7 +32,7 @@ _hasher = PasswordHasher(
     parallelism=4,
     hash_len=32,
     salt_len=16,
-    type=__import__("argon2").Type.ID,
+    type=Type.ID,
 )
 
 
@@ -48,7 +48,7 @@ def verify_password(password: str, password_hash: str) -> bool:
     """
     try:
         return _hasher.verify(password_hash, password)
-    except VerifyMismatchError, InvalidHashError:
+    except (VerificationError, InvalidHashError):
         return False
 
 

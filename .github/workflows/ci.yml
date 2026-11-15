@@ -67,6 +67,12 @@ jobs:
   identity:
     name: Identity Service Checks
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: ci-identity-${{ github.ref }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
 
     services:
       postgres:
@@ -114,6 +120,9 @@ jobs:
 
       - name: Ruff lint
         run: poetry run ruff check .
+
+      - name: Run tests
+        run: poetry run pytest -v
 
       - name: Build Docker image
         run: docker build -t flowops-identity:ci .
