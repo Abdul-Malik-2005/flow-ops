@@ -48,7 +48,7 @@ def verify_password(password: str, password_hash: str) -> bool:
     """
     try:
         return _hasher.verify(password_hash, password)
-    except (VerificationError, InvalidHashError):
+    except VerificationError, InvalidHashError:
         return False
 
 
@@ -85,6 +85,17 @@ def _public_key() -> RSAPublicKey:
     if not isinstance(key, RSAPublicKey):
         raise TypeError(f"Expected RSA public key, got {type(key).__name__}")
     return key
+
+
+def load_keys() -> None:
+    """Eagerly load and validate both JWT keys.
+
+    Called from the application lifespan so a service with missing/broken keys
+    fails at startup instead of serving `/health` and then returning 500 on the
+    first `/auth/login`.
+    """
+    _private_key()
+    _public_key()
 
 
 # ---------------------------------------------------------------------------

@@ -8,3 +8,6 @@ __pycache__
 .env
 tests
 *.md
+# Defence in depth: the Dockerfile copies only app/alembic/migrations, so keys
+# never reach the image today. This keeps that true if a `COPY . .` is added.
+keys

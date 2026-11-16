@@ -1,6 +1,6 @@
 # FlowOps — техническая передача проекта (Handoff)
 
-**Актуально на:** Шаг 3 Identity Service — **ЗАКРЫТ** (части A, B, C: безопасность, тесты безопасности, CI + Docker-сборка). Следующий — Шаг 4.
+**Актуально на:** Шаг 3 Identity — **ЗАКРЫТ** (A+B+C). Шаг 4, **часть A** (схемы, репозитории, сервисы, зависимости, эндпоинты, Docker secrets) — **ЗАКРЫТА**. Следующая — Шаг 4, часть B (автотесты бизнес-логики).
 **Репозиторий:** https://github.com/Abdul-Malik-2005/flow-ops
 **Наставник:** senior Python Backend архитектор. Общение на русском, уровень Middle+, без базовых объяснений FastAPI. Работать небольшими этапами, не переходить к следующему, пока текущий не проверен. Давать полный код файла с точным путём. Не менять архитектурные решения молча. **Предлагать не «проще», а надёжнее** — с учётом корректности при сбоях, совместимости миграций, безопасности, предсказуемости в проде.
 
@@ -38,7 +38,7 @@ transactional outbox).
   status), `ReservationItem` (FK cascade, composite FK).
 - Не переписывать без конкретной причины/бага/нового требования.
 
-### Identity Service — ШАГИ 1, 2, 3 ЗАКРЫТЫ
+### Identity Service — ШАГИ 1–3 ЗАКРЫТЫ, ШАГ 4 ЧАСТЬ A ЗАКРЫТА
 
 **Шаг 1 — каркас (закрыт):**
 
@@ -187,18 +187,61 @@ transactional outbox).
     исключён.
 - Коммит `identity: ci — pytest in identity job, security fixes (step 3, part C)`.
 
-**Следующие шаги (4–5):**
+**Шаг 4, часть A — схемы, репозитории, сервисы, зависимости, эндпоинты (ЗАКРЫТА):**
 
-- **Шаг 4:** схемы, репозитории, сервисный слой, `get_current_user`,
-  `require_admin`, эндпоинты (`/auth/register`, `/auth/login`,
-  `/auth/refresh`, `/auth/logout`, `/auth/me`, `/users`).
-- **Шаг 5:** тесты бизнес-логики (register/login/refresh/logout/me —
-  unit + integration), минимум 10 помимо тестов безопасности.
-- **Задача на старт Шага 4 (из разбора кода):** JWT-ключи через Docker secrets
-  + fail-fast в `lifespan` (вызов `_private_key()`/`_public_key()` при старте).
-  Сейчас сервис стартует без ключей (ленивая загрузка), но `/login` упадёт
-  с 500. Профессиональный подход: secrets в compose, проверка при запуске.
+- **Схемы:** `app/schemas/auth.py` (`RegisterRequest`, пароль 8..128;
+  `LoginRequest` **без** `min_length` — короткий пароль даёт 401, а не 422;
+  `RefreshRequest`, `TokenPair`), `app/schemas/user.py` (`UserResponse`:
+  `id: UUID`, `email: EmailStr`, `role`, `is_active`, `created_at`,
+  `updated_at`; `password_hash` физически отсутствует).
+- **Зависимость:** добавлен `email-validator` (нужен для `EmailStr`),
+  `poetry lock` + `poetry install` выполнены.
+- **Репозитории (только SQL, без commit):** `user.py` (`get_by_email`,
+  `get_by_id`, `create`, `list_all(limit/offset)` с сортировкой
+  `created_at, id`), `refresh_token.py` (`get_by_jti`,
+  `get_by_jti_for_update` — `SELECT ... FOR UPDATE`, `create`, `revoke`,
+  `revoke_all_for_user`), `login_attempt.py` (`record`).
+- **Исключения:** `app/services/exceptions.py` — 6 доменных классов
+  (включая `InvalidAccessTokenError`), без HTTP-знания.
+- **`AuthService`:** `register` (хеш вне транзакции, `IntegrityError` →
+  `UserAlreadyExistsError`), `login` (dummy-хеш при неизвестном email —
+  выравнивание таймингов; `LoginAttempt` пишется всегда; исключение
+  бросается **после** коммита, иначе аудит откатится), `refresh` (ротация
+  `revoked_at` + `replaced_by_jti`, повторное использование → отзыв всей
+  цепочки и 401), `logout` (идемпотентный), `get_current_user` (роль
+  читается из БД, не из claim). `UserService` — чтение.
+- **`app/api/deps.py`:** `HTTPBearer(auto_error=False)` (кнопка Authorize в
+  Swagger, 401 + `WWW-Authenticate`), `get_current_user`, `require_admin`.
+- **Эндпоинты:** `POST /auth/register` (201, 409), `POST /auth/login`
+  (200/401/403), `POST /auth/refresh` (200/401/403), `POST /auth/logout`
+  (204), `GET /auth/me`, `GET /users` (admin only, `limit<=200`,
+  `offset>=0`). `router.py` включает роутеры без `prefix` (иначе
+  `/auth/auth/...`).
+- **Docker:** в `compose.yaml` секции `secrets:` (`jwt_private_key`,
+  `jwt_public_key`) → `/run/secrets/...` + `JWT_*_KEY_PATH` в env;
+  `keys` добавлен в `.dockerignore`. `security.load_keys()` вызывается в
+  `lifespan` (fail-fast, кроме `ENVIRONMENT=testing`).
+- **Проверено:** `ruff check`/`format` чисто; 13 тестов безопасности passed;
+  OpenAPI содержит 6 эндпоинтов `/api/v1/*`; Docker e2e:
+  `register 201 → login → /me 200 → refresh 200 → повторный refresh старым
+  токеном 401 → ротированный токен после отзыва цепочки 401`;
+  `GET /users` обычным пользователем → 403; `/me` без токена → 401;
+  в БД `refresh_tokens` ровно 3 строки (живой / ротированный / отозванный
+  цепочкой), `login_attempts` пишутся; контейнер без ключей падает на старте
+  (`FileNotFoundError`, exit code 3) вместо «healthy без логина».
+- Коммит `identity: auth api — schemas, repositories, services, endpoints (step 4, part A)`.
+
+**Следующее (Шаг 4, часть B; затем Шаг 5):**
+
+- **Шаг 4, часть B — автотесты бизнес-логики:** unit-тесты `AuthService` с
+  фейковой сессией/репозиториями (register дубликат, login wrong/unknown/
+  inactive, аудит сохраняется при 401, ротация refresh, детект reuse +
+  отзыв цепочки, logout идемпотентен, `get_current_user` inactive) и
+  API-тесты через ASGI-транспорт с подменой `get_session`.
+- **Шаг 5:** интеграционные тесты против реальной PostgreSQL (в CI уже есть
+  сервис `postgres`), финализация.
 - `/ready` с проверкой БД — открытый вопрос, не блокирует.
+- Rate limiting на `/auth/login` — когда появится Redis.
 - Метрики Prometheus, Redis-кэш, Nginx — по мере появления остальных сервисов.
 
 **Известные особенности (не баги):**

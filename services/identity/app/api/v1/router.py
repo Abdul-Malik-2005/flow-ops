@@ -1,8 +1,13 @@
-# from fastapi import APIRouter
+"""API v1 aggregate router.
 
-# from app.api.v1.endpoints import auth, users
+Each endpoint module declares its own prefix and tags, so they are included
+as-is — declaring a prefix here as well would double it (`/auth/auth/...`).
+"""
 
-# router = APIRouter()
+from fastapi import APIRouter
 
-# router.include_router(auth.router, prefix="/auth", tags=["auth"])
-# router.include_router(users.router, prefix="/users", tags=["users"])
+from app.api.v1.endpoints import auth, users
+
+router = APIRouter()
+router.include_router(auth.router)
+router.include_router(users.router)
