@@ -69,6 +69,8 @@ services:
 
     volumes:
       - identity_postgres_data:/var/lib/postgresql/data
+      # Creates `identity_test_db` on the first start (see the SQL file).
+      - ./docker/identity/init-test-db.sql:/docker-entrypoint-initdb.d/10-test-db.sql:ro
 
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U identity_user -d identity_db"]
