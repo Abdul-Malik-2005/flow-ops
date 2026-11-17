@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
 # Ensure settings can be constructed before any `app.*` import.
@@ -22,10 +22,15 @@ os.environ.setdefault("ENVIRONMENT", "testing")
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from httpx import ASGITransport, AsyncClient
 
 from app.core import security
 from app.core.config import settings
+from app.db.session import get_session
+from app.main import app
 from app.models.user import UserRole
+from app.services.auth import AuthService
+from tests.fakes import FakeAsyncSession, install_fakes
 
 
 def _generate_keypair(directory: Path) -> tuple[Path, Path]:
@@ -86,3 +91,55 @@ def access_token(jwt_keys: None, user_id: uuid.UUID) -> str:
 @pytest.fixture()
 def refresh_token(jwt_keys: None, user_id: uuid.UUID, refresh_jti: uuid.UUID) -> str:
     return security.create_refresh_token(user_id, refresh_jti)
+
+
+# ---------------------------------------------------------------------------
+# Fake persistence + API client (Шаг 4, часть B)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def fake_session() -> FakeAsyncSession:
+    """Fresh in-memory storage for every test."""
+    return FakeAsyncSession()
+
+
+@pytest.fixture()
+def auth_service(
+    fake_session: FakeAsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    jwt_keys: None,
+) -> AuthService:
+    """`AuthService` wired to the fake repositories instead of SQL."""
+    install_fakes(monkeypatch)
+    return AuthService(fake_session)
+
+
+@pytest.fixture()
+async def api_client(
+    fake_session: FakeAsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    jwt_keys: None,
+) -> AsyncIterator[AsyncClient]:
+    """`AsyncClient` talking to the real ASGI app: no network, no database.
+
+    `get_session` is overridden once for the whole app, so every endpoint —
+    including the ones that construct services themselves — receives the same
+    fake session. `ASGITransport` does not run lifespan events, and keys come
+    from the `jwt_keys` fixture.
+    """
+    install_fakes(monkeypatch)
+
+    async def override_get_session() -> AsyncIterator[FakeAsyncSession]:
+        yield fake_session
+
+    app.dependency_overrides[get_session] = override_get_session
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as client:
+            yield client
+    finally:
+        app.dependency_overrides.pop(get_session, None)

@@ -1,6 +1,6 @@
 # FlowOps — техническая передача проекта (Handoff)
 
-**Актуально на:** Шаг 3 Identity — **ЗАКРЫТ** (A+B+C). Шаг 4, **часть A** (схемы, репозитории, сервисы, зависимости, эндпоинты, Docker secrets) — **ЗАКРЫТА**. Следующая — Шаг 4, часть B (автотесты бизнес-логики).
+**Актуально на:** Шаг 3 Identity — **ЗАКРЫТ** (A+B+C). Шаг 4 — **ЗАКРЫТ** (часть A: схемы/репозитории/сервисы/эндпоинты/Docker secrets; часть B: unit- и API-тесты бизнес-логики). Следующая — Шаг 5 (интеграционные тесты + финализация).
 **Репозиторий:** https://github.com/Abdul-Malik-2005/flow-ops
 **Наставник:** senior Python Backend архитектор. Общение на русском, уровень Middle+, без базовых объяснений FastAPI. Работать небольшими этапами, не переходить к следующему, пока текущий не проверен. Давать полный код файла с точным путём. Не менять архитектурные решения молча. **Предлагать не «проще», а надёжнее** — с учётом корректности при сбоях, совместимости миграций, безопасности, предсказуемости в проде.
 
@@ -38,7 +38,7 @@ transactional outbox).
   status), `ReservationItem` (FK cascade, composite FK).
 - Не переписывать без конкретной причины/бага/нового требования.
 
-### Identity Service — ШАГИ 1–3 ЗАКРЫТЫ, ШАГ 4 ЧАСТЬ A ЗАКРЫТА
+### Identity Service — ШАГИ 1–3 ЗАКРЫТЫ, ШАГ 4 (A+B) ЗАКРЫТ
 
 **Шаг 1 — каркас (закрыт):**
 
@@ -231,18 +231,73 @@ transactional outbox).
   (`FileNotFoundError`, exit code 3) вместо «healthy без логина».
 - Коммит `identity: auth api — schemas, repositories, services, endpoints (step 4, part A)`.
 
-**Следующее (Шаг 4, часть B; затем Шаг 5):**
+**Шаг 4, часть B — автотесты бизнес-логики (ЗАКРЫТА):**
 
-- **Шаг 4, часть B — автотесты бизнес-логики:** unit-тесты `AuthService` с
-  фейковой сессией/репозиториями (register дубликат, login wrong/unknown/
-  inactive, аудит сохраняется при 401, ротация refresh, детект reuse +
-  отзыв цепочки, logout идемпотентен, `get_current_user` inactive) и
-  API-тесты через ASGI-транспорт с подменой `get_session`.
-- **Шаг 5:** интеграционные тесты против реальной PostgreSQL (в CI уже есть
-  сервис `postgres`), финализация.
+- Производственный код **не менялся** — только тесты. Проверено: `pytest -q`
+  → **66 passed** (13 безопасности + 27 сервис + 26 API), `ruff check` и
+  `ruff format --check` чисто.
+- `tests/fakes.py` — мини-БД вместо `AsyncMock`, потому что тестам нужны две
+  вещи, которые мок скрывает: границы транзакций (аудит/отзыв цепочки
+  коммитятся **до** исключения) и «flush применяет server/default-значения»
+  (у только что созданного `User` нет `id`, `role`, `created_at` до INSERT).
+  - `FakeAsyncSession`: `begin()` → `FakeTransaction` (async CM), при входе
+    снимается снимок строк, при чистом выходе `committed += 1`, при исключении
+    `rolled_back += 1` и состояние восстанавливается; `add()` + `flush()`
+    проставляют дефолты (`id`, `role`, `is_active`, `created_at`, `updated_at`).
+    Счётчики `begun/committed/rolled_back` — часть контракта тестов.
+  - `FakeUserRepository`, `FakeRefreshTokenRepository` (включая
+    `revoke_all_for_user`), `FakeLoginAttemptRepository` — тот же интерфейс,
+    без SQL; `DuplicateOnInsertUserRepository` бросает `IntegrityError`
+    (гонка двух регистраций).
+  - `install_fakes(monkeypatch)` подменяет классы репозиториев **в модулях
+    сервисов** (`app.services.auth`, `app.services.user`), поэтому сервисы,
+    созданные эндпоинтами, работают на фейках без изменения DI.
+  - `create_user(...)` хеширует пароль через `password_hash_for()` —
+    мемоизация: Argon2id ~100 мс на хеш, иначе тесты распухают по времени.
+- `tests/conftest.py` — новые фикстуры: `fake_session`, `auth_service`
+  (`AuthService` на фейках), `api_client` (`httpx.ASGITransport` к реальному
+  `app`, `app.dependency_overrides[get_session]` → фейковая сессия, `lifespan`
+  не выполняется, ключи из `jwt_keys`).
+- `tests/test_auth_service.py` — **27 тестов**: normalize_email (3 параметра);
+  register (успех с нормализацией email, дубликат без учёта регистра,
+  `IntegrityError` → `UserAlreadyExistsError`); login (пара токенов + аудит с
+  `ip`, неверный пароль с сохранённым аудитом при 401, неизвестный email —
+  проверено, что верифицируется настоящий `$argon2id$`-хеш, inactive →
+  `UserInactiveError` + аудит `success=True`); refresh (ротация и
+  `replaced_by_jti`, unknown/revoked/expired, reuse → отзыв всей цепочки и
+  последующий отказ, inactive → **rollback** без отзыва, удалённый
+  пользователь, мусор/access-токен вместо refresh); logout (только
+  предъявленный токен, идемпотентность, мусорный токен без транзакции);
+  `get_current_user` (ok, мусор, refresh вместо access, удалённый, inactive).
+- `tests/test_auth_api.py` — **26 тестов**: register 201 (нет `password_hash`),
+  409 без утечек, 422 на короткий/длинный пароль, кривой email, отсутствие
+  поля; login 200 + `token_type`, 401 неотличимы для «неверный пароль» и
+  «неизвестный email» (+`WWW-Authenticate: Bearer`), короткий пароль → 401 (не
+  422), inactive → 403; refresh 200/401/reuse-401/чужой access 401/inactive 403
+  (токен не отозван); logout 204 + идемпотентность + 204 на мусор; `/auth/me`
+  401 без токена, 401 на мусор, 200 + роль, 403 inactive; `/users` 401 без
+  токена, 403 обычному, 200 админу, `limit=0/201/offset=-1` → 422.
+- **Мутационная проверка осмысленности тестов:** отключение
+  `revoke_all_for_user` в ветке reuse роняет ровно два теста
+  (`test_refresh_reuse_revokes_whole_chain` и
+  `test_refresh_rotates_and_detects_reuse`), затем код восстановлен
+  `git checkout --`.
+- Замечание на будущее (не баг, решение не принималось): стандартный
+  `RequestValidationError` FastAPI возвращает поле `input`, поэтому 422 на
+  `POST /auth/register` содержит отправленный пароль в теле ответа. Если это
+  нежелательно (логи, APM), нужен свой обработчик, который вычищает `input`
+  для полей-паролей.
+
+**Следующее (Шаг 5):**
+
+- Интеграционные тесты против реальной PostgreSQL (в CI уже есть сервис
+  `postgres`), проверка миграции и `FOR UPDATE` на настоящей БД.
+- Финализация Identity: `/ready`, README по локальному запуску (включая
+  `scripts/gen_keys.py` перед `docker compose up`).
 - `/ready` с проверкой БД — открытый вопрос, не блокирует.
 - Rate limiting на `/auth/login` — когда появится Redis.
 - Метрики Prometheus, Redis-кэш, Nginx — по мере появления остальных сервисов.
+
 
 **Известные особенности (не баги):**
 
@@ -415,9 +470,14 @@ flow_ops/
 │ ├── init.py
 │ ├── main.py
 │ ├── api/
+│ │ ├── deps.py # HTTPBearer, get_current_user, require_admin
 │ │ └── v1/
 │ │ ├── init.py
-│ │ └── router.py
+│ │ ├── router.py
+│ │ └── endpoints/
+│ │ ├── init.py
+│ │ ├── auth.py
+│ │ └── users.py
 │ ├── core/
 │ │ ├── init.py
 │ │ ├── config.py
@@ -432,15 +492,26 @@ flow_ops/
 │ │ ├── refresh_token.py
 │ │ └── login_attempt.py
 │ ├── repositories/
-│ │ └── init.py
+│ │ ├── init.py
+│ │ ├── user.py
+│ │ ├── refresh_token.py
+│ │ └── login_attempt.py
 │ ├── schemas/
-│ │ └── init.py
+│ │ ├── init.py
+│ │ ├── auth.py
+│ │ └── user.py
 │ └── services/
-│ └── init.py
+│ ├── init.py
+│ ├── exceptions.py
+│ ├── auth.py
+│ └── user.py
 └── tests/
 ├── init.py
-├── conftest.py
-└── test_security.py
+├── conftest.py # jwt_keys, fake_session, auth_service, api_client
+├── fakes.py # in-memory session + fake repositories
+├── test_security.py # 13
+├── test_auth_service.py # 27
+└── test_auth_api.py # 26
 
 text
 
@@ -498,7 +569,7 @@ text
 
 ---
 
-## 6. План Identity: Шаги 3 (часть C), 4, 5
+## 6. План Identity: Шаг 3 (часть C) — закрыт, Шаг 4 — закрыт, Шаг 5 — следующий
 
 ### Шаг 3, часть A — безопасность — ЗАКРЫТА
 
@@ -508,42 +579,36 @@ text
 
 См. раздел 2 (Identity, Шаг 3, часть B). 13 тестов passed, закоммичено.
 
-### Шаг 3, часть C — CI + Docker-сборка (СЛЕДУЮЩАЯ)
+### Шаг 3, часть C — CI + Docker-сборка — ЗАКРЫТА
 
-- `.github/workflows/ci.yml`, job `identity`: добавить шаг
-  `- name: Run tests` / `run: poetry run pytest -v` между `ruff` и
-  `docker build` (по образцу job `inventory`). Плюс `ruff format --check .`
-  и `ruff check .` уже есть.
-- Проверить `docker compose build identity-api` — образ собирается с
-  `argon2-cffi`, `pyjwt`, `cryptography`; `poetry.lock` консистентен
-  (Poetry 2.4.3 в Dockerfile = локальная версия).
-- Опционально: поднять `identity-db` + `identity-api`, проверить, что
-  миграция применяется при старте (не должно быть регрессий от Шага 2).
-- Коммит `identity: ci — pytest in identity job (step 3, part C)`.
-- Обновить handoff (Шаг 3 закрыт).
+См. раздел 2 (Identity, Шаг 3, часть C). `pytest -v` в job `identity`,
+Docker-сборка и старт с миграцией проверены, закоммичено.
 
-### Шаг 4 — схемы, репозитории, сервис, эндпоинты, зависимости
+### Шаг 4 — схемы, репозитории, сервисы, эндпоинты — ЗАКРЫТ (A + B)
 
-- `app/schemas/auth.py`, `app/schemas/user.py`.
-- `app/repositories/user.py`, `refresh_token.py`, `login_attempt.py`.
-- `app/services/auth.py` (register, login, refresh с ротацией и отзывом
-  цепочки, logout), `app/services/user.py` (get/list).
-- `app/api/deps.py`: `get_current_user` (Bearer access, type=access, загрузка
-  user из БД), `require_admin`.
-- `app/api/v1/endpoints/auth.py`, `users.py`; наполнить `router.py`.
-- Обработка ошибок: 401/403/409/422, без утечки внутренних деталей.
-- **Проверка:** Swagger, ручной прогон register→login→refresh→logout→me,
-  повторный refresh с использованным токеном → 401 + отзыв цепочки.
-- Тесты на схемы/сервисы/эндпоинты — часть Шага 4 (unit + integration
-  с моками). Шаг 5 — только оставшиеся интеграционные и финализация.
+- **Часть A:** `app/schemas/{auth,user}.py`,
+  `app/repositories/{user,refresh_token,login_attempt}.py`,
+  `app/services/{auth,user,exceptions}.py`, `app/api/deps.py`,
+  `app/api/v1/endpoints/{auth,users}.py`, наполненный `router.py`,
+  Docker secrets + fail-fast в `lifespan`. Ручной/сквозной Docker-прогон и
+  коммит `identity: auth api — ... (step 4, part A)`.
+- **Часть B:** `tests/fakes.py`, фикстуры `fake_session`/`auth_service`/
+  `api_client` в `tests/conftest.py`, `tests/test_auth_service.py` (27),
+  `tests/test_auth_api.py` (26). Итого 66 passed, ruff чисто,
+  производственный код не менялся. См. раздел 2.
+- Коммит `identity: auth tests — services + api on in-memory fakes (step 4, part B)`.
 
-### Шаг 5 — тесты + финализация
+### Шаг 5 — интеграционные тесты + финализация (СЛЕДУЮЩИЙ)
 
-- `services/identity/tests/` — минимум 10 тестов помимо 13 тестов
-  безопасности (unit + integration).
-- CI job `identity`: убедиться, что `pytest -v` зелёный (добавлен на
-  Шаге 3, часть C).
+- Интеграционные тесты против реальной PostgreSQL (сервис `postgres` в CI уже
+  есть): миграция `upgrade head`, регистрация/логин/ротация на настоящих
+  таблицах, `SELECT ... FOR UPDATE` под параллельными refresh, отзыв цепочки.
+- `/ready` с проверкой БД (или явное решение отложить).
+- README по локальному запуску: `scripts/gen_keys.py` → `docker compose up`
+  (без ключей `identity-api` падает на старте — это ожидаемый fail-fast).
+- CI job `identity`: убедиться, что `pytest -v` зелёный с новыми тестами.
 - Обновить handoff.
+
 
 ---
 
@@ -558,6 +623,10 @@ text
 - Стратегия миграций B (one-off `identity-migrate`) — при переходе к Nginx.
 - Rate limiting на `/auth/login` (Redis, скользящее окно или token bucket) —
   когда появится Redis; сейчас `LoginAttempt` пишется, но не блокирует.
+- 422-ответы FastAPI содержат поле `input`, поэтому 422 на
+  `POST /auth/register` возвращает отправленный пароль в теле ответа. Нужен
+  ли свой обработчик `RequestValidationError`, вычищающий `input` для
+  полей-паролей (логи/APM), — решить отдельно; сейчас поведение штатное.
 - В Inventory: политика повторного `order_id` с отличающимся payload
   (вариант A — первый побеждает, вариант B — 409). Не менять без контракта
   Order.
@@ -626,30 +695,46 @@ upgrade/downgrade/upgrade чистый, коммит сделан.
   миграция применяется при старте; правки безопасности в `security.py` (импорт `Type`,
   ловля `VerificationError`); коммит `identity: ci — pytest in identity job, security fixes (step 3, part C)`.
 
-**Следующий — Шаг 4:** схемы, репозитории, сервис, эндпоинты.
+**Шаг 4 Identity — ЗАКРЫТ (части A, B):**
+
+- **часть A:** схемы, три репозитория, `AuthService`/`UserService`,
+  `deps.py`, эндпоинты `/auth/*` и `/users`, `email-validator`, Docker
+  secrets + fail-fast в `lifespan`; коммит
+  `491de96 identity: auth api — schemas, repositories, services, endpoints (step 4, part A)`.
+- **часть B:** `tests/fakes.py` (in-memory session с реальными границами
+  транзакций + фейковые репозитории), фикстуры `fake_session`/`auth_service`/
+  `api_client`, `tests/test_auth_service.py` (27), `tests/test_auth_api.py` (26);
+  66 passed, ruff чисто, производственный код не менялся; коммит
+  `identity: auth tests — services + api on in-memory fakes (step 4, part B)`.
+
+**Следующий — Шаг 5:** интеграционные тесты против реальной PostgreSQL,
+`/ready`, README локального запуска, финализация Identity.
 
 Inventory не трогать.
 
-**Перед началом Шага 4 — согласовать решения:**
+**Перед началом Шага 5 — согласовать решения:**
 
-1. JWT-ключи через Docker secrets + fail-fast в `lifespan` (задача из части C).
-2. Формы Pydantic, обработка ошибок (401/403/409/422 без утечек).
-3. Стратегия ротации refresh + отзыв цепочки при повторном использовании.
-4. Rate limiting на `/auth/login` — опционально (Redis появится позже).
+1. Тестовая БД: локально `identity-db` (5433) или отдельная `identity_test_db`;
+   в CI сервис `postgres` уже поднят.
+2. `TEST_DATABASE_URL` — поле в `Settings` есть, но тесты его пока не
+   используют (фейки работают без БД). Нужна защита «только `*_test_db`»,
+   как в Inventory.
+3. Как именно проверять `SELECT ... FOR UPDATE` под конкурентными refresh —
+   два параллельных запроса/сессии.
+4. `/ready` с проверкой БД: делать на Шаге 5 или отложить.
 
 10. Инструкция для первого ответа после передачи
 Кратко подтверди понимание идеи FlowOps и текущего статуса
-(Inventory готов; Identity — Шаги 1 и 2 закрыты, Шаг 3 части A и B
-закрыты, часть C — следующий шаг).
+(Inventory готов; Identity — Шаги 1–3 закрыты, Шаг 4 части A и B закрыты,
+Шаг 5 — следующий шаг: интеграционные тесты на реальной PostgreSQL).
 
 Зафиксируй правило, что Inventory не переписывается и не затрагивается.
 
-Обозначь следующий этап — Шаг 3, часть C Identity: pytest -v в CI
-job identity, проверка docker compose build identity-api с новыми
-зависимостями, обновление handoff.
+Обозначь следующий этап — Шаг 5 Identity: интеграционные тесты, `/ready`,
+README локального запуска, финализация и обновление handoff.
 
-Предложи начать с согласования плана части C (раздел 6) и проверки,
-что локальные тесты (13) и ruff зелёные перед правкой ci.yml.
+Предложи начать с согласования плана Шага 5 (раздел 6) и проверки,
+что локальные тесты (66) и ruff зелёные перед добавлением БД-тестов.
 
 Задавай строго один действительно необходимый вопрос за раз.
 
