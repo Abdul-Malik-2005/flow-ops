@@ -162,6 +162,22 @@ async def clear_lease(
         await session.commit()
 
 
+async def set_reservation_attempts(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    order_id: uuid.UUID,
+    attempts: int,
+) -> None:
+    """Pin the attempt counter, so the budget cap can be reached in one pass."""
+    async with session_factory() as session:
+        await session.execute(
+            update(Order)
+            .where(Order.id == order_id)
+            .values(reservation_attempts=attempts)
+        )
+        await session.commit()
+
+
 async def set_created_at(
     session_factory: async_sessionmaker[AsyncSession],
     *,

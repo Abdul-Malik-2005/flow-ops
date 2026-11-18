@@ -196,6 +196,44 @@ services:
       retries: 5
       start_period: 15s
 
+  # Same image as the API, different entry point: the API starts a reservation,
+  # this process finishes the ones whose answer was lost. No ports and no
+  # healthcheck: it serves no traffic, and "the process is up" is not the same
+  # as "the worker is making progress" — the report log is what an operator
+  # watches instead.
+  order-reconciler:
+    build:
+      context: ./services/order
+      dockerfile: Dockerfile
+
+    container_name: flowops-order-reconciler
+    restart: unless-stopped
+
+    environment:
+      DATABASE_URL: postgresql+asyncpg://order_user:dev_password@order-db:5432/order_db
+      DEBUG: "false"
+      ENVIRONMENT: production
+      INVENTORY_BASE_URL: http://inventory-api:8000
+      SERVICE_TOKEN: local-dev-service-token
+      INVENTORY_TIMEOUT_SECONDS: "5.0"
+      # MUST stay equal to the API's value: both processes decide whether a
+      # reserve call may still be in flight from this single number, and a
+      # mismatch makes one of them act on a row the other still considers busy.
+      RESERVATION_STALE_AFTER_SECONDS: "30.0"
+      RECONCILE_INTERVAL_SECONDS: "30.0"
+      RECONCILE_BATCH_SIZE: "20"
+      # Budget of attempts per order; then it fails as `reservation_unavailable`.
+      RESERVATION_MAX_ATTEMPTS: "20"
+      # Error-log threshold for orders still pending. Never changes state.
+      PENDING_ALERT_AFTER_SECONDS: "900.0"
+
+    depends_on:
+      order-db:
+        condition: service_healthy
+
+    # No `alembic upgrade` here: the API owns the schema, one migrator is enough.
+    command: python -m app.worker
+
 volumes:
   inventory_postgres_data:
   identity_postgres_data:
