@@ -53,3 +53,53 @@ def test_lease_shorter_than_twice_the_timeout_is_rejected() -> None:
 def test_lease_must_be_positive() -> None:
     with pytest.raises(ValidationError):
         build_settings(reservation_stale_after_seconds=0)
+
+
+# ---------------------------------------------------------------------------
+# Reconciler
+# ---------------------------------------------------------------------------
+
+
+def test_alert_threshold_cannot_precede_the_lease() -> None:
+    """Otherwise every normal reconcile pass would cry wolf."""
+    with pytest.raises(ValidationError, match="pending_alert_after_seconds"):
+        build_settings(
+            reservation_stale_after_seconds=30.0,
+            pending_alert_after_seconds=29.9,
+        )
+
+
+def test_alert_threshold_equal_to_the_lease_is_accepted() -> None:
+    settings = build_settings(
+        reservation_stale_after_seconds=30.0,
+        pending_alert_after_seconds=30.0,
+    )
+
+    assert settings.pending_alert_after_seconds == 30.0
+
+
+def test_reconciler_defaults_leave_room_for_retries() -> None:
+    settings = build_settings()
+
+    assert settings.reconcile_batch_size >= 1
+    assert settings.reservation_max_attempts >= 1
+    assert (
+        settings.pending_alert_after_seconds > settings.reservation_stale_after_seconds
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"reconcile_batch_size": 0},
+        {"reconcile_batch_size": 101},
+        {"reconcile_interval_seconds": 0},
+        {"reservation_max_attempts": 0},
+        {"pending_alert_after_seconds": 0},
+    ],
+)
+def test_out_of_range_reconciler_values_are_rejected(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        build_settings(**overrides)

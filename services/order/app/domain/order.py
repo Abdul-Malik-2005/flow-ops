@@ -40,6 +40,10 @@ class OrderReason(StrEnum):
     INSUFFICIENT_STOCK = "insufficient_stock"
     INVENTORY_ITEM_NOT_FOUND = "inventory_item_not_found"
     INVENTORY_REJECTED = "inventory_rejected"
+    #: The reconciler retried the reservation until the attempt budget ran out
+    #: and Inventory was still unreachable. Terminal by design: an order that
+    #: nobody will ever retry must not look like a fresh `pending` one.
+    RESERVATION_UNAVAILABLE = "reservation_unavailable"
 
 
 CANCELLATION_REASONS: frozenset[OrderReason] = frozenset({OrderReason.USER_REQUESTED})
@@ -49,6 +53,7 @@ FAILURE_REASONS: frozenset[OrderReason] = frozenset(
         OrderReason.INSUFFICIENT_STOCK,
         OrderReason.INVENTORY_ITEM_NOT_FOUND,
         OrderReason.INVENTORY_REJECTED,
+        OrderReason.RESERVATION_UNAVAILABLE,
     }
 )
 

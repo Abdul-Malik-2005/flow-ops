@@ -37,6 +37,17 @@ class Settings(BaseSettings):
     # still-running call could be mistaken for an abandoned one.
     reservation_stale_after_seconds: float = Field(default=30.0, gt=0)
 
+    # Reconciler: a separate process started from the same image. A `pending`
+    # order whose lease has expired means the reserve call was lost (or its
+    # outcome never reached the database), so the worker re-drives it. After
+    # `reservation_max_attempts` such claims the order is failed instead of
+    # being retried forever. The alert threshold only drives an error log and
+    # never changes state.
+    reconcile_interval_seconds: float = Field(default=30.0, gt=0)
+    reconcile_batch_size: int = Field(default=20, ge=1, le=100)
+    reservation_max_attempts: int = Field(default=20, ge=1)
+    pending_alert_after_seconds: float = Field(default=900.0, gt=0)
+
     # Currency is stored from the first order onwards, while the amounts stay
     # NULL until Catalog becomes the source of prices.
     default_currency: str = "RUB"
@@ -49,6 +60,19 @@ class Settings(BaseSettings):
                 "reservation_stale_after_seconds must be at least twice "
                 f"inventory_timeout_seconds ({minimum}), got "
                 f"{self.reservation_stale_after_seconds}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _alert_cannot_precede_the_lease(self) -> Self:
+        # An alert for an order that is still inside its first lease window
+        # would cry wolf on every normal reconcile pass.
+        if self.pending_alert_after_seconds < self.reservation_stale_after_seconds:
+            raise ValueError(
+                "pending_alert_after_seconds must be at least "
+                f"reservation_stale_after_seconds "
+                f"({self.reservation_stale_after_seconds}), got "
+                f"{self.pending_alert_after_seconds}"
             )
         return self
 

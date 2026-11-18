@@ -137,6 +137,17 @@ def test_reason_sets_are_disjoint() -> None:
     assert CANCELLATION_REASONS.isdisjoint(FAILURE_REASONS)
 
 
+def test_every_failure_reason_terminalises_a_pending_order() -> None:
+    """Including the reconciler's give-up reason: same gate as the rest."""
+    assert OrderReason.RESERVATION_UNAVAILABLE in FAILURE_REASONS
+
+    for reason in FAILURE_REASONS:
+        assert (
+            ensure_transition(OrderStatus.PENDING, OrderStatus.FAILED, reason)
+            is OrderStatus.FAILED
+        )
+
+
 # ---------------------------------------------------------------------------
 # Normalisation
 # ---------------------------------------------------------------------------
