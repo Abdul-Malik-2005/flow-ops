@@ -37,6 +37,32 @@ def failure_reason(outcome: ReservationOutcome) -> OrderReason:
     return FAILURE_REASONS[outcome]
 
 
+async def fail_exhausted_reservation(
+    *,
+    repository: OrderRepositoryPort,
+    order_id: uuid.UUID,
+) -> OrderRecord | None:
+    """Terminalise an order whose retry budget ran out.
+
+    Called when the claim spent more than the allowed number of attempts and
+    Inventory is still unreachable. `pending` would be a lie here: nobody will
+    ever retry this order again, so it must stop looking fresh in the feed.
+
+    Returns `None` when a cancel won the race (same contract as
+    `apply_terminal_outcome`).
+    """
+    reason = OrderReason.RESERVATION_UNAVAILABLE
+    ensure_transition(OrderStatus.PENDING, OrderStatus.FAILED, reason)
+
+    return await repository.transition(
+        order_id=order_id,
+        from_status=OrderStatus.PENDING,
+        to_status=OrderStatus.FAILED,
+        reason=reason,
+        clear_lease=True,
+    )
+
+
 async def apply_terminal_outcome(
     *,
     repository: OrderRepositoryPort,
