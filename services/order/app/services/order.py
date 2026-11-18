@@ -34,7 +34,6 @@ from app.domain.order import (
     OrderLine,
     OrderReason,
     canonical_request_hash,
-    ensure_transition,
     normalize_lines,
 )
 from app.models.order import Order, OrderStatus
@@ -56,6 +55,7 @@ from app.services.exceptions import (
     OrderStateChangedError,
 )
 from app.services.pricing import PricingPort, total_amount
+from app.services.reservation import apply_terminal_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -216,18 +216,32 @@ class OrderService:
         user_id: uuid.UUID,
         reservation: ReservationResult,
     ) -> CreateOrderResult:
-        if reservation.outcome is ReservationOutcome.RESERVED:
-            record = await self._transition(
-                order_id=order_id,
-                to_status=OrderStatus.RESERVED,
-                inventory_reservation_id=reservation.reservation_id,
-                clear_lease=True,
+        if reservation.is_retryable:
+            # Nothing to write: `pending` plus a fresh lease is the accurate
+            # description of "we do not know". The reconciler retries later,
+            # which is safe because Inventory is idempotent by `order_id`.
+            logger.warning(
+                "order %s stays pending: inventory outcome is unknown",
+                order_id,
             )
-            if record is None:
+            return CreateOrderResult(
+                record=await self._require(order_id=order_id, user_id=user_id),
+                created=True,
+                reservation_pending=True,
+            )
+
+        record = await apply_terminal_outcome(
+            repository=self._repository,
+            order_id=order_id,
+            reservation=reservation,
+        )
+
+        if record is None:
+            await self._session.rollback()
+            if reservation.is_reserved:
                 # A cancel won the race after Inventory reserved. The order must
                 # not be resurrected, and the stock is orphaned: Inventory has no
                 # release endpoint, so this is logged loudly for manual cleanup.
-                await self._session.rollback()
                 logger.error(
                     "order %s was no longer pending but reservation %s succeeded; "
                     "stock stays blocked until Inventory exposes a release",
@@ -239,31 +253,6 @@ class OrderService:
                     created=True,
                 )
 
-            await self._session.commit()
-            return CreateOrderResult(record=record, created=True)
-
-        if reservation.outcome is ReservationOutcome.UNAVAILABLE:
-            # Nothing to write: `pending` plus a fresh lease is the accurate
-            # description of "we do not know". The reconciler (later block) will
-            # retry, which is safe because Inventory is idempotent by order_id.
-            logger.warning(
-                "order %s stays pending: inventory outcome is unknown",
-                order_id,
-            )
-            return CreateOrderResult(
-                record=await self._require(order_id=order_id, user_id=user_id),
-                created=True,
-                reservation_pending=True,
-            )
-
-        record = await self._transition(
-            order_id=order_id,
-            to_status=OrderStatus.FAILED,
-            reason=_FAILURE_REASONS[reservation.outcome],
-            clear_lease=True,
-        )
-        if record is None:
-            await self._session.rollback()
             logger.error(
                 "order %s left pending while its reservation failed with %s",
                 order_id,
@@ -272,30 +261,10 @@ class OrderService:
             raise OrderStateChangedError(order_id)
 
         await self._session.commit()
+        if reservation.is_reserved:
+            return CreateOrderResult(record=record, created=True)
+
         raise _FAILURE_ERRORS[reservation.outcome](order_id)
-
-    async def _transition(
-        self,
-        *,
-        order_id: uuid.UUID,
-        to_status: OrderStatus,
-        reason: OrderReason | None = None,
-        inventory_reservation_id: uuid.UUID | None = None,
-        clear_lease: bool = False,
-    ) -> OrderRecord | None:
-        from_status = OrderStatus.PENDING
-        # The domain table is checked here as well as in the repository, so an
-        # illegal saga step fails in a unit test instead of only in the database.
-        ensure_transition(from_status, to_status, reason)
-
-        return await self._repository.transition(
-            order_id=order_id,
-            from_status=from_status,
-            to_status=to_status,
-            reason=reason,
-            inventory_reservation_id=inventory_reservation_id,
-            clear_lease=clear_lease,
-        )
 
     async def _require(
         self,
@@ -372,14 +341,9 @@ class OrderService:
         return result.record
 
 
-# Terminal Inventory answers -> domain reason and public error, in one place so a
-# new outcome cannot be mapped inconsistently in two branches.
-_FAILURE_REASONS: dict[ReservationOutcome, OrderReason] = {
-    ReservationOutcome.REJECTED: OrderReason.INSUFFICIENT_STOCK,
-    ReservationOutcome.ITEM_NOT_FOUND: OrderReason.INVENTORY_ITEM_NOT_FOUND,
-    ReservationOutcome.INVALID_REQUEST: OrderReason.INVENTORY_REJECTED,
-}
-
+# Terminal Inventory answers -> the error the API raises. The reason that goes
+# into the status history lives next to the shared TX2 mapping in
+# `app.services.reservation`, so both callers cannot disagree about it.
 _FAILURE_ERRORS: dict[ReservationOutcome, type[InsufficientStockError]] = {
     ReservationOutcome.REJECTED: InsufficientStockError,
     ReservationOutcome.ITEM_NOT_FOUND: InventoryItemNotFoundError,
