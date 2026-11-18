@@ -143,6 +143,25 @@ async def age_lease(
         await session.commit()
 
 
+async def clear_lease(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    order_id: uuid.UUID,
+) -> None:
+    """Drop the lease marker: the state of an order no worker ever touched.
+
+    `NULL` is what the claim predicate treats as "definitely no call in flight",
+    which is a different case from "the call was lost long ago" (`age_lease`).
+    """
+    async with session_factory() as session:
+        await session.execute(
+            update(Order)
+            .where(Order.id == order_id)
+            .values(reservation_started_at=None)
+        )
+        await session.commit()
+
+
 async def set_created_at(
     session_factory: async_sessionmaker[AsyncSession],
     *,

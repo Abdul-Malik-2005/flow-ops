@@ -141,11 +141,43 @@ class OrderRepositoryPort(Protocol):
         reason: OrderReason,
     ) -> CancelResult: ...
 
+    async def claim_stale_pending(
+        self,
+        *,
+        limit: int,
+        stale_after_seconds: float,
+    ) -> list[OrderRecord]:
+        """Lease abandoned `pending` orders for one more reservation attempt.
+
+        One statement does all of it: pick the candidates, set the lease
+        (`reservation_started_at = now()`) and spend an attempt
+        (`reservation_attempts += 1`). Both happen *before* the caller makes the
+        HTTP call, so a worker that dies mid-attempt still pays for it and the
+        order cannot be retried forever.
+
+        No commit: the caller owns the transaction boundary, exactly as the saga
+        does. The claim transaction must stay short — the HTTP call happens
+        after it commits, never while row locks are held.
+        """
+        ...
+
+    async def count_pending_older_than(self, *, seconds: float) -> int:
+        """Orders stuck in `pending` for longer than `seconds`.
+
+        Alerting only: nothing is written. The worker logs an error when the
+        number is non-zero, which is the cheapest symptom of a dead Inventory.
+        """
+        ...
+
 
 # `make_interval(secs => ...)` keeps the comparison on the database clock. Using
 # `datetime.now()` in Python would compare two clocks and could let a cancel slip
 # in while the reserve call is still running.
 _STALE_CUTOFF_SQL = "now() - make_interval(secs => :stale_after_seconds)"
+
+# Same database clock, different question: "how long has this row been
+# sitting untouched" instead of "has its lease expired".
+_INTERVAL_AGO_SQL = "now() - make_interval(secs => :seconds)"
 
 
 class SqlOrderRepository:
@@ -374,6 +406,76 @@ class SqlOrderRepository:
             CancelStatus.CANCELLED,
             OrderRecord(order=order, items=await self._items(order_id)),
         )
+
+    async def claim_stale_pending(
+        self,
+        *,
+        limit: int,
+        stale_after_seconds: float,
+    ) -> list[OrderRecord]:
+        stale_cutoff = text(_STALE_CUTOFF_SQL).bindparams(
+            bindparam("stale_after_seconds", value=stale_after_seconds, type_=Float)
+        )
+
+        candidates = (
+            select(Order.id)
+            .where(
+                Order.status == OrderStatus.PENDING,
+                # Same predicate as cancellation: a fresh lease means a reserve
+                # call may still be in flight, so nobody else may touch the row.
+                or_(
+                    Order.reservation_started_at.is_(None),
+                    Order.reservation_started_at < stale_cutoff,
+                ),
+            )
+            # Oldest first: a backlog drains in creation order, and the keyset
+            # is deterministic when two orders share a timestamp.
+            .order_by(Order.created_at, Order.id)
+            .limit(limit)
+            # Two workers busy with the same backlog: the second one skips the
+            # rows already being updated instead of blocking behind them.
+            .with_for_update(skip_locked=True)
+        )
+
+        statement = (
+            update(Order)
+            .where(Order.id.in_(candidates))
+            .values(
+                reservation_started_at=func.now(),
+                reservation_attempts=Order.reservation_attempts + 1,
+                updated_at=func.now(),
+            )
+            .returning(Order)
+            # The ORM cannot evaluate `now() - make_interval(...)` in Python, and
+            # `RETURNING` already gives the fresh state of every row.
+            .execution_options(synchronize_session=False)
+        )
+
+        orders = list((await self._session.scalars(statement)).all())
+        if not orders:
+            return []
+
+        # `RETURNING` has no defined order; restore the claim order explicitly.
+        orders.sort(key=lambda order: (order.created_at, order.id))
+        grouped = await self._items_by_order([order.id for order in orders])
+        return [
+            OrderRecord(order=order, items=grouped.get(order.id, []))
+            for order in orders
+        ]
+
+    async def count_pending_older_than(self, *, seconds: float) -> int:
+        cutoff = text(_INTERVAL_AGO_SQL).bindparams(
+            bindparam("seconds", value=seconds, type_=Float)
+        )
+        statement = (
+            select(func.count())
+            .select_from(Order)
+            .where(
+                Order.status == OrderStatus.PENDING,
+                Order.created_at < cutoff,
+            )
+        )
+        return await self._session.scalar(statement) or 0
 
     async def _items(self, order_id: uuid.UUID) -> list[OrderItem]:
         grouped = await self._items_by_order([order_id])

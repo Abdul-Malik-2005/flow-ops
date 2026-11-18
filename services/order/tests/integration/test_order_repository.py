@@ -27,6 +27,7 @@ from tests.integration.helpers import (
     WAREHOUSE,
     age_lease,
     build_order,
+    clear_lease,
     count_orders,
     history_of,
     insert_order,
@@ -487,3 +488,169 @@ async def test_list_is_scoped_to_the_owner(
 
     assert len(records) == 1
     assert records[0].order.user_id == owner_id
+
+
+# ---------------------------------------------------------------------------
+# Reconciler feed
+# ---------------------------------------------------------------------------
+
+
+async def test_claim_takes_only_orders_with_an_expired_lease(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    user_id = uuid.uuid4()
+    fresh = await insert_order(session_factory, user_id=user_id)
+    lost = await insert_order(session_factory, user_id=user_id)
+    untouched = await insert_order(session_factory, user_id=user_id)
+    await age_lease(session_factory, order_id=lost.order.id, seconds=3600)
+    await clear_lease(session_factory, order_id=untouched.order.id)
+
+    async with session_factory() as session:
+        records = await SqlOrderRepository(session).claim_stale_pending(
+            limit=10,
+            stale_after_seconds=STALE_AFTER,
+        )
+        await session.commit()
+
+    # A fresh lease proves a call may still be in flight: hands off.
+    claimed = {record.order.id for record in records}
+    assert claimed == {lost.order.id, untouched.order.id}
+    assert fresh.order.id not in claimed
+
+
+async def test_claim_spends_an_attempt_and_closes_the_window(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    created = await insert_order(session_factory, user_id=uuid.uuid4())
+    await age_lease(session_factory, order_id=created.order.id, seconds=3600)
+
+    async with session_factory() as session:
+        claimed = await SqlOrderRepository(session).claim_stale_pending(
+            limit=10,
+            stale_after_seconds=STALE_AFTER,
+        )
+        await session.commit()
+
+    assert len(claimed) == 1
+    assert claimed[0].order.reservation_attempts == 1
+    assert claimed[0].order.reservation_started_at is not None
+
+    # The refreshed lease hides the order until it expires again: the lease *is*
+    # the backoff, so no separate `next_attempt_at` column is needed.
+    async with session_factory() as session:
+        again = await SqlOrderRepository(session).claim_stale_pending(
+            limit=10,
+            stale_after_seconds=STALE_AFTER,
+        )
+        await session.commit()
+
+    assert again == []
+
+
+async def test_claim_ignores_orders_that_left_pending(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    created = await insert_order(session_factory, user_id=uuid.uuid4())
+    await age_lease(session_factory, order_id=created.order.id, seconds=3600)
+
+    async with session_factory() as session:
+        moved = await SqlOrderRepository(session).transition(
+            order_id=created.order.id,
+            from_status=OrderStatus.PENDING,
+            to_status=OrderStatus.CANCELLED,
+            reason=OrderReason.USER_REQUESTED,
+        )
+        assert moved is not None
+        await session.commit()
+
+    async with session_factory() as session:
+        claimed = await SqlOrderRepository(session).claim_stale_pending(
+            limit=10,
+            stale_after_seconds=STALE_AFTER,
+        )
+        await session.commit()
+
+    assert claimed == []
+
+
+async def test_claim_respects_the_batch_limit(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    user_id = uuid.uuid4()
+    expected: set[uuid.UUID] = set()
+    for _ in range(2):
+        created = await insert_order(session_factory, user_id=user_id)
+        await age_lease(session_factory, order_id=created.order.id, seconds=3600)
+        expected.add(created.order.id)
+
+    claimed_ids: list[uuid.UUID] = []
+    for _ in range(2):
+        async with session_factory() as session:
+            batch = await SqlOrderRepository(session).claim_stale_pending(
+                limit=1,
+                stale_after_seconds=STALE_AFTER,
+            )
+            await session.commit()
+        claimed_ids.extend(record.order.id for record in batch)
+
+    # Two one-order passes drain the backlog without repeating an order.
+    assert len(claimed_ids) == 2
+    assert set(claimed_ids) == expected
+
+
+async def test_a_second_worker_does_not_claim_a_held_row(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`SKIP LOCKED`: the second worker starts on the backlog, not on a wait."""
+    created = await insert_order(session_factory, user_id=uuid.uuid4())
+    await age_lease(session_factory, order_id=created.order.id, seconds=3600)
+
+    async with session_factory() as first, session_factory() as second:
+        claimed_by_first = await SqlOrderRepository(first).claim_stale_pending(
+            limit=10,
+            stale_after_seconds=STALE_AFTER,
+        )
+        claimed_by_second = await SqlOrderRepository(second).claim_stale_pending(
+            limit=10,
+            stale_after_seconds=STALE_AFTER,
+        )
+        assert [record.order.id for record in claimed_by_first] == [created.order.id]
+        assert claimed_by_second == []
+        await first.commit()
+
+    async with session_factory() as session:
+        # One claim, one attempt: the row was never double-spent.
+        stored = await SqlOrderRepository(session).get(
+            order_id=created.order.id,
+            user_id=created.order.user_id,
+        )
+        assert stored is not None
+        assert stored.order.reservation_attempts == 1
+
+
+async def test_count_pending_older_than_counts_only_stuck_pending_orders(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    user_id = uuid.uuid4()
+    stuck = await insert_order(session_factory, user_id=user_id)
+    resolved = await insert_order(session_factory, user_id=user_id)
+    await insert_order(session_factory, user_id=user_id)
+
+    old_moment = datetime.now(UTC) - timedelta(hours=2)
+    await set_created_at(session_factory, order_id=stuck.order.id, moment=old_moment)
+    await set_created_at(session_factory, order_id=resolved.order.id, moment=old_moment)
+
+    async with session_factory() as session:
+        repository = SqlOrderRepository(session)
+        assert await repository.count_pending_older_than(seconds=3600) == 2
+
+        moved = await repository.transition(
+            order_id=resolved.order.id,
+            from_status=OrderStatus.PENDING,
+            to_status=OrderStatus.RESERVED,
+            clear_lease=True,
+        )
+        assert moved is not None
+        await session.commit()
+
+        assert await repository.count_pending_older_than(seconds=3600) == 1
