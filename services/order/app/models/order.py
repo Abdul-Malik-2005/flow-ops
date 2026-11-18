@@ -16,6 +16,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     Index,
+    Integer,
     Numeric,
     String,
     func,
@@ -156,10 +157,23 @@ class Order(Base):
     # cleared in TX2. While it is fresh, cancellation is refused, because the
     # reservation request may still land and Inventory has no release endpoint —
     # a cancelled order would keep stock blocked forever
-    # (docs/architecture.md §5).
+    # (docs/architecture.md §5). The reconciler reuses the marker as the start
+    # of the *most recent* attempt: an expired marker means "no call in flight",
+    # which is exactly the claim predicate.
     reservation_started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
+    )
+
+    # How many times the reconciler has claimed the order for a retry. The claim
+    # statement increments it *before* the HTTP call, so a worker that dies
+    # mid-attempt still spends budget; once the budget is exhausted the order
+    # fails as `reservation_unavailable` instead of being retried forever.
+    reservation_attempts: Mapped[int] = mapped_column(
+        Integer(),
+        nullable=False,
+        default=0,
+        server_default=text("0"),
     )
 
     created_at: Mapped[datetime] = mapped_column(
