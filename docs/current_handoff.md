@@ -1,50 +1,68 @@
 ﻿# FlowOps — Текущий статус (Current Handoff)
 
-**Актуальный сервис:** `services/identity`
-**Статус:** Шаг 5 **ЗАКРЫТ**. Identity завершён: 87 тестов (66 unit/API на фейках + 21 интеграционный на реальной PostgreSQL), `ruff check` и `ruff format --check` зелёные, README готов.
-**Следующая задача:** новый сервис (согласовать в PLAN: Catalog или Order). Код `services/identity` и `services/inventory` не трогать.
+**Актуальный сервис:** `services/order` (блоки 1–5 **закрыты**)
+**Статус:** 147 тестов зелёные (115 unit/API + 32 интеграционных на реальном Postgres), `ruff check`/`ruff format --check` чисто, `alembic upgrade head` + `check` → "No new upgrade operations detected" (`c7d2e5f13a08`), `downgrade -1` + `upgrade` проверены.
+**Следующая задача:** блок 6 — реконсилер «зависших» `pending` (повторный `reserve` по `order_id`; Inventory идемпотентен). `services/inventory` и `services/identity` **не трогать**.
 
 ---
 
-## Что реализовано (Identity Service)
-- **БД:** `User` (`UserRole`: `admin`/`user`), `RefreshToken`, `LoginAttempt`; миграция `1c0512ab888f`, применяется при старте контейнера.
-- **Безопасность:** Argon2id (OWASP-параметры), RS256 + `kid`, ключи через `scripts/gen_keys.py` и Docker secrets, dummy-хеш против timing-атак.
-- **API:** `POST /auth/register`, `/auth/login`, `/auth/refresh`, `/auth/logout`; `GET /auth/me`, `/users`; `GET /health` (liveness) и `GET /ready` (readiness, `SELECT 1`).
-- **Логика:** ротация refresh с `replaced_by_jti`, отзыв всей цепочки при reuse (коммит **до** 401), идемпотентный logout, роль и `is_active` читаются из БД, аудит каждой попытки входа коммитится даже при 401/403.
+## Что готово (блок 5: сага + API + идемпотентность + пагинация)
+- **Конфиг:** `RESERVATION_STALE_AFTER_SECONDS` с `model_validator` (`>= 2 * INVENTORY_TIMEOUT_SECONDS`); иначе lease ничего не доказывает. Есть в `.env.example` и `compose.yaml`.
+- **Домен (`app/domain/`):** `OrderReason` (cancellation/failure наборы не пересекаются), таблица `ALLOWED_TRANSITIONS` (`reserved` без исходящих рёбер), `normalize_lines()` (схлопывание дублей + детерминированный порядок), `canonical_request_hash()`, `ensure_transition/reason`.
+- **Схемы:** `extra="forbid"` на входных моделях (`user_id` в теле → 422), `MAX_ORDER_LINES=100`; ответ не отдаёт `user_id`, `idempotency_key`, `request_hash`.
+- **БД:** колонка `orders.reservation_started_at` + обратимая миграция `c7d2e5f13a08` (nullable, `NULL` = «попытки вызова не было»).
+- **Клиент Inventory (`app/clients/inventory.py`):** `InventoryClientPort` + httpx-реализация; один `httpx.AsyncClient` на процесс в `app.state` (создаётся/закрывается в `lifespan`), DI через `get_inventory_client`. Маппинг: 201/200→`reserved`, 409→`rejected`, 404→`item_not_found`, 400/422→`invalid_request`, 429/5xx/timeout/битый 2xx→`unavailable`. **Клиент не бросает исключений на бизнес-ответы.**
+- **Pricing (`app/services/pricing.py`):** `PricingPort` + `NullPricing`; `total_amount()` → `None`, если хотя бы одна строка не оценена (никаких частичных сумм).
+- **Репозиторий (`app/repositories/order.py`):** `OrderCursor`, `CancelStatus`, `SqlOrderRepository`; идемпотентность — `pg_insert(...).on_conflict_do_nothing(index_where=...)` (без savepoint, сессия остаётся живой); переходы — compare-and-set `UPDATE ... WHERE status = :expected`; отмена — под lease (`reservation_started_at IS NULL OR < now() - make_interval(secs => :x)`). **Репозиторий никогда не коммитит** — транзакциями владеет сервис.
+- **Сервис (`app/services/order.py`):** сага `TX1 (insert pending + history) → COMMIT → HTTP reserve → TX2 (применить исход + lease)`; повтор с тем же `Idempotency-Key` и тем же телом → 200 + исходный заказ; с другим телом → 409.
+- **API (`/api/v1/orders`):** POST (201/200/202/409/422/502), GET list (keyset, opaque base64url-курсор, битый → 400), GET one (404 и для чужого), POST `{id}/cancel` (200/404/409, `reason` в теле → 422). Роутер подключён в `app/main.py` под `/api/v1`, `/health` и `/ready` остались в корне.
 
-## Интеграционный контур (`services/identity/tests/integration/`)
-- `conftest.py` — guard: имя БД обязано оканчиваться на `_test_db`, повторная проверка через `SELECT current_database()`; схема пересоздаётся раз за сессию (`DROP/CREATE SCHEMA public` + `alembic upgrade head` в подпроцессе); autouse `TRUNCATE users, refresh_tokens, login_attempts RESTART IDENTITY CASCADE`; engine с `NullPool` на каждый тест; `api_client` с реальной `async_sessionmaker`.
-- `helpers.py` — INSERT-хелперы (`create_user`, `create_refresh_row`) с memoized Argon2-хешем, `run_alembic`, `login`, `refresh_jti`.
-- `test_auth_flow.py` (9) — нормализация email и `$argon2id$`, живая строка refresh + аудит, `/me` по `is_active`, `/users` по роли из БД, ротация, reuse, logout, inactive 403 с откатом, expired 401.
-- `test_login_audit.py` (4) — аудит неверного пароля/неизвестного email/неактивного пользователя, проверка хелпера.
-- `test_migrations.py` (1) — одноразовая БД: `upgrade → downgrade base → upgrade`, проверки `to_regclass`, head из `ScriptDirectory`, enum `user_role` = `admin, user`, `replaced_by_jti` без FK, `gen_random_uuid()`, `finally DROP ... WITH (FORCE)`; нет `CREATEDB` → fail, не skip.
-- `test_refresh_concurrency.py` (1) — два независимых engine, `asyncio.gather` → `[200, 401]`, 2 строки / 0 активных, токен победителя тоже отозван.
-- `test_ready.py` (3) и `test_database.py` (3) — smoke схемы и пробы.
+## Тесты
 
-## Изменения вне тестов
-- `app/main.py` — `GET /ready`; `/health` остался liveness; compose-healthcheck пока на `/health` (переключить при появлении оркестратора).
-- `pyproject.toml` — маркер `integration`, `addopts = --strict-markers`.
-- `.env.example` (и локальный `.env`) — `TEST_DATABASE_URL` на `localhost:5433/identity_test_db` с комментарием про суффикс.
-- `compose.yaml` + `docker/identity/init-test-db.sql` — создание `identity_test_db` при первой инициализации volume; для уже существующего volume: `docker compose exec identity-db createdb -U identity_user identity_test_db`.
-- `.github/workflows/ci.yml` — `REQUIRE_INTEGRATION_TESTS: "1"` в job `identity`.
-- `services/identity/README.md` — запуск (сначала `scripts/gen_keys.py`), env-таблица, миграции, тесты, API, безопасность, `/health` vs `/ready`.
+- **115 unit/API:** `test_health` (4), `test_security` (8), `test_deps` (5), `test_config` (4), `test_domain` (29), `test_schemas` (10), `test_inventory_client` (16, `MockTransport`), `test_pricing` (5), `test_pagination` (9), `test_orders_api` (25, `FakeOrderService` + `dependency_overrides`).
+- **32 интеграционных** (`tests/integration/`): 18 репозиторий + 14 сага (включая доказательство, что TX1 закоммичен **до** HTTP-вызова, и кейс «отмена выиграла гонку»).
+- **Изоляция:** `conftest.py` — дроп схемы → `alembic upgrade head` → `TRUNCATE` перед каждым тестом; guard на имя БД (`_test_db`) и `REQUIRE_INTEGRATION_TESTS=1` → hard fail вместо тихого skip.
+- Локально без `TEST_DATABASE_URL`: 115 passed, 32 skipped (skip, не error).
+
+## CI (`.github/workflows/ci.yml`, job `order`)
+
+`ruff format --check` → `ruff check` → `alembic upgrade head` → `alembic check` → `pytest -v` → `docker build`; добавлен `REQUIRE_INTEGRATION_TESTS: "1"`.
+
+## План следующего шага (блок 6: реконсилер)
+
+1. `app/services/reconciler.py` — выбирает `pending` старше `RESERVATION_STALE_AFTER_SECONDS` (partial-индекс `(created_at) WHERE status='pending'` уже есть), повторяет `reserve` по тому же `order_id`, применяет исход как TX2.
+2. Пачка через `FOR UPDATE SKIP LOCKED`: два инстанса не сделают один и тот же вызов.
+3. Логи/метрики: `pending` старше N минут → `error` с `order_id` (симптом «Inventory лежит»).
+4. Тесты: восстановление после timeout и после «reserve применился, TX2 — нет».
+
+**Вопросы к согласованию:**
+1. Реконсилер как отдельный процесс (entrypoint + `asyncio.sleep`) или `POST /internal/reconcile` под cron? (Влияет на деплой и на необходимость сервисного токена.)
+2. Сколько попыток и когда переводим `pending → failed` (`reservation_unavailable`)? Нужна ли отдельная причина `reservation_expired`?
+3. Outbox в этом же блоке или отдельным? RabbitMQ в `compose.yaml` пока нет.
 
 ## Команды
+
 ```
 # из корня репозитория
-docker compose up -d identity-db
+docker compose up -d order-db
 
-cd services/identity
-poetry run pytest -q
-poetry run ruff check .
-poetry run ruff format --check .
+cd services/order
+poetry run alembic upgrade head && poetry run alembic check
+poetry run pytest -q        # без БД: 115 passed, 32 skipped
+# полный прогон:
+$env:TEST_DATABASE_URL='postgresql+asyncpg://order_user:dev_password@localhost:5434/order_test_db'
+$env:REQUIRE_INTEGRATION_TESTS='1'; poetry run pytest -q   # 147 passed
+poetry run ruff check . && poetry run ruff format --check .
 ```
 
 ## Подводные камни
-- Нужен запущенный Docker Desktop; тестовая БД — контейнер `identity-db` на `:5433`, не нативный PostgreSQL на `:5432`.
-- `poetry.lock` содержал `email-validator`, но локальное venv было неполным — лечится `poetry install --with dev`.
-- Guard сравнивает имя БД с `DATABASE_URL` **из файла `.env`** через `dotenv_values`: корневой `tests/conftest.py` подставляет плейсхолдер `DATABASE_URL`, указывающий на `*_test_db`, поэтому `settings.database_url` для этой проверки не годится.
-- В CI `DATABASE_URL == TEST_DATABASE_URL`, `.env` отсутствует — работает суффикс-гард + проверка `current_database()`.
-- Alembic после `downgrade base` оставляет пустую таблицу `alembic_version` — тест это учитывает.
-- Argon2id ~100 мс на хеш: пользователи/токены в тестах создаются INSERT-хелперами.
-- Схема тестовой БД пересоздаётся один раз за сессию: два параллельных pytest-прогона на одной `identity_test_db` конфликтуют.
+
+- **Отмена не освобождает резерв:** у Inventory нет `release`; если reserve успел после отмены, резерв остаётся (логируем `error`, заказ не воскрешаем). Ограничение проекта, не баг.
+- `failed` и `cancelled` — терминальные: повторная отмена → 409 (договорённость API).
+- Lease сравнивается **в SQL** (`now() - make_interval(secs => :x)`), не в Python: часы приложения и БД расходятся.
+- `HTTP_422_UNPROCESSABLE_ENTITY` в Starlette устарела → использовать `HTTP_422_UNPROCESSABLE_CONTENT`.
+- В новом FastAPI роутеры подключаются лениво (`_IncludedRouter`): обход `app.routes` показывает не всё, пути проверять через `app.openapi()["paths"]`.
+- Windows: API по `127.0.0.1:8002`, не `localhost` (IPv6). `order-db` (:5434), `order-api` (:8002).
+- Partial-индексы содержат литерал `'pending'` в `WHERE`; новый статус в enum — миграция в два шага (`ALTER TYPE ... ADD VALUE` вне транзакции).
+- Env-переменные PowerShell живут между командами одной сессии: перед «локальным» прогоном сбрасывать `REQUIRE_INTEGRATION_TESTS`.
+

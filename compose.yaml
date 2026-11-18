@@ -122,9 +122,84 @@ services:
       retries: 5
       start_period: 15s
 
+  order-db:
+    image: postgres:17-alpine
+    container_name: flowops-order-db
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: order_db
+      POSTGRES_USER: order_user
+      POSTGRES_PASSWORD: dev_password
+
+    ports:
+      - "5434:5432"
+
+    volumes:
+      - order_postgres_data:/var/lib/postgresql/data
+      # Creates `order_test_db` on the first start (see the SQL file).
+      - ./docker/order/init-test-db.sql:/docker-entrypoint-initdb.d/10-test-db.sql:ro
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U order_user -d order_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  order-api:
+    build:
+      context: ./services/order
+      dockerfile: Dockerfile
+
+    container_name: flowops-order-api
+    restart: unless-stopped
+
+    environment:
+      DATABASE_URL: postgresql+asyncpg://order_user:dev_password@order-db:5432/order_db
+      DEBUG: "false"
+      ENVIRONMENT: production
+      # Only the public key: Order verifies Identity tokens, it never signs.
+      JWT_PUBLIC_KEY_PATH: /run/secrets/jwt_public_key
+      INVENTORY_BASE_URL: http://inventory-api:8000
+      # Static inter-service credential (dev value). Inventory ignores it today;
+      # it becomes a checked header once that contract is implemented.
+      SERVICE_TOKEN: local-dev-service-token
+      INVENTORY_TIMEOUT_SECONDS: "5.0"
+      # Cancellation is refused while a reserve call may still be in flight.
+      RESERVATION_STALE_AFTER_SECONDS: "30.0"
+      DEFAULT_CURRENCY: RUB
+
+    secrets:
+      - jwt_public_key
+
+    ports:
+      - "8002:8000"
+
+    depends_on:
+      order-db:
+        condition: service_healthy
+
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
 volumes:
   inventory_postgres_data:
   identity_postgres_data:
+  order_postgres_data:
 
 # File-based secrets for local development. In a real deployment the same two
 # names are provided by Docker Swarm / Kubernetes secret objects, so the

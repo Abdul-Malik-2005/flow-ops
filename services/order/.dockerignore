@@ -1,0 +1,12 @@
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.git
+.gitignore
+.env
+tests
+*.md
+# The public key arrives as a Docker secret, never from the build context.
+keys
