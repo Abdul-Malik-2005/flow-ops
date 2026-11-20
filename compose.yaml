@@ -234,10 +234,315 @@ services:
     # No `alembic upgrade` here: the API owns the schema, one migrator is enough.
     command: python -m app.worker
 
+  # The second half of the outbox: the API and the reconciler only *write*
+  # events, this process is the one that publishes them. Same image as the API,
+  # different entry point. No ports and no healthcheck for the same reason as the
+  # reconciler: it serves no traffic, and "the process is up" says nothing about
+  # "events are moving" — the `RelayReport` line in the log is what an operator
+  # watches instead.
+  order-outbox-relay:
+    build:
+      context: ./services/order
+      dockerfile: Dockerfile
+
+    container_name: flowops-order-outbox-relay
+    restart: unless-stopped
+
+    environment:
+      DATABASE_URL: postgresql+asyncpg://order_user:dev_password@order-db:5432/order_db
+      DEBUG: "false"
+      ENVIRONMENT: production
+      # Spelled out in full, even where they equal the code defaults: the
+      # behaviour of the process must be readable from this file, and a changed
+      # default in `Settings` must not silently change production.
+      # Invariant checked at start-up: OUTBOX_LEASE_SECONDS >= 2 *
+      # OUTBOX_RELAY_INTERVAL_SECONDS. A pass has to finish before its own lease
+      # expires, otherwise another relay reclaims rows that are still in flight.
+      OUTBOX_RELAY_INTERVAL_SECONDS: "5.0"
+      OUTBOX_BATCH_SIZE: "50"
+      # Also the backoff: a failed publish writes nothing, so the row comes back
+      # only when this lease runs out.
+      OUTBOX_LEASE_SECONDS: "30.0"
+      OUTBOX_MAX_ATTEMPTS: "10"
+      # Which adapter the port gets. `rabbitmq`, not `log`: the consumer service
+      # below binds a durable queue to this exchange at start-up, so every event
+      # has a destination. `log` stays the code default for runs without
+      # infrastructure (pytest, a local `--once`); production is explicit here.
+      OUTBOX_PUBLISHER: rabbitmq
+      RABBITMQ_URL: amqp://flowops:dev_password@rabbitmq:5672/
+      # One exchange per producer: `order` owns its stream and can evolve or
+      # delete it without asking other services. Routing key = event type
+      # (`order.reserved`), so a consumer picks `order.reserved` or `order.#`.
+      OUTBOX_EXCHANGE: order.events
+
+    depends_on:
+      order-db:
+        condition: service_healthy
+      # The transport is `rabbitmq` now, so the broker is a real dependency: a
+      # relay that starts before it would spend one attempt of every claimed row
+      # on a refused connection.
+      rabbitmq:
+        condition: service_healthy
+
+    # The relay needs no secrets and no Inventory address: it publishes rows that
+    # are already committed and knows nothing about the saga that wrote them.
+
+    # No `alembic upgrade`: the API owns the schema. If this process starts
+    # before the migration, the first passes fail on a missing table, log the
+    # error and sleep — it catches up on its own instead of crash-looping.
+    command: python -m app.outbox_relay
+
+    # Not "how long it runs": the budget for reaching the safe stop point. The
+    # signal handler only flips an `asyncio.Event`, and the loop stops between
+    # passes, so the worst case is finishing the batch already claimed. 35s =
+    # lease (30) + interval (5): the lease is the design limit on one pass, and
+    # the extra interval is the time the loop needs to notice the stop event.
+    # Revisit when the transport becomes a network client (RabbitMQ): real
+    # publish timeouts make a batch slower, and this number follows the lease,
+    # not the other way around.
+    stop_grace_period: 35s
+
+  # The transport for order events. The relay publishes here, and the consumer
+  # service below journals what it receives; both speak to this broker.
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    container_name: flowops-rabbitmq
+    restart: unless-stopped
+
+    environment:
+      RABBITMQ_DEFAULT_USER: flowops
+      RABBITMQ_DEFAULT_PASS: dev_password
+
+    ports:
+      # Loopback only: this broker eventually holds every event in the system,
+      # and in development it must not answer to the network. The second port is
+      # the management UI (http://127.0.0.1:15672), which is how an operator
+      # inspects queues and unroutable messages without writing a script.
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+    healthcheck:
+      # `ping` answers over the Erlang distribution port, so it proves the node
+      # is up *and* accepting CLI commands; the AMQP listener opens a moment
+      # later, which `start_period` covers. No management HTTP check on purpose:
+      # the relay speaks AMQP, not HTTP, and a green UI is not the same thing.
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  # The read side of the exchange above: journals every delivery into
+  # `order_event_projections` and never publishes anything. Same image as the
+  # API, different entry point. No ports and no healthcheck for the same reason
+  # as the relay: it serves no traffic, and "the process is up" says nothing
+  # about "the backlog is moving" — the journal rows and the log are what an
+  # operator watches instead.
+  order-event-consumer:
+    build:
+      context: ./services/order
+      dockerfile: Dockerfile
+
+    container_name: flowops-order-event-consumer
+    restart: unless-stopped
+
+    environment:
+      DATABASE_URL: postgresql+asyncpg://order_user:dev_password@order-db:5432/order_db
+      DEBUG: "false"
+      ENVIRONMENT: production
+      RABBITMQ_URL: amqp://flowops:dev_password@rabbitmq:5672/
+      OUTBOX_EXCHANGE: order.events
+      # The queue belongs to its consumer: the producer declares only the
+      # exchange. These names and the delivery limit are this process's contract
+      # with the broker and must not be shared with another queue.
+      EVENT_CONSUMER_QUEUE: order.event-projections
+      EVENT_CONSUMER_DLX_EXCHANGE: order.events.dlx
+      EVENT_CONSUMER_DLQ: order.event-projections.dlq
+      EVENT_CONSUMER_PREFETCH_COUNT: "10"
+      # Deliveries accepted before the runtime refuses the message without
+      # requeue (dead letter). It reads the broker's `x-acquired-count`:
+      # RabbitMQ 4 does not apply `x-delivery-limit` to an explicit requeue.
+      # A deterministic refusal is dead-lettered on the first delivery.
+      EVENT_CONSUMER_MAX_DELIVERY_COUNT: "5"
+      # One info line per interval: processed/duplicates/retried/refused/
+      # dead_lettered. Per-event lines stay at DEBUG.
+      EVENT_CONSUMER_REPORT_INTERVAL_SECONDS: "60.0"
+      # Interruptible pause after a transient failure: without it a database
+      # outage would requeue in a tight loop and exhaust the limit in
+      # milliseconds.
+      EVENT_CONSUMER_REQUEUE_DELAY_SECONDS: "2.0"
+      EVENT_CONSUMER_RECONNECT_DELAY_SECONDS: "5.0"
+
+    depends_on:
+      order-db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+    # No `alembic upgrade`: the API owns the schema. If this process starts
+    # before the migration it fails to journal, logs the error and requeues, with
+    # the pause above preventing a hot loop; it catches up on its own.
+    command: python -m app.event_consumer
+
+    # The callback handles one message at a time, so the safe stop point is the
+    # current commit; the pause after a transient failure is interruptible
+    # (`sleep_or_stop`) and does not delay shutdown.
+    stop_grace_period: 15s
+
+  # Notification owns its own database: it cannot read Order's tables, and the
+  # inbox is the only durable fact it needs. The test database is created by the
+  # SQL file on first start, so integration tests never touch `notification_db`.
+  notification-db:
+    image: postgres:17-alpine
+    container_name: flowops-notification-db
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: notification_db
+      POSTGRES_USER: notification_user
+      POSTGRES_PASSWORD: dev_password
+
+    ports:
+      - "5435:5432"
+
+    volumes:
+      - notification_postgres_data:/var/lib/postgresql/data
+      - ./docker/notification/init-test-db.sql:/docker-entrypoint-initdb.d/10-test-db.sql:ro
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notification_user -d notification_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # The first consumer of `order.events` that lives in another service. It binds
+  # its own queue and records every delivery in `notification_inbox`, proving the
+  # cross-service contract without importing a line of Order's code. No ports and
+  # no healthcheck for the same reason as Order's consumer: it serves no traffic,
+  # and "the process is up" says nothing about "the backlog is moving" — the
+  # report log is what an operator watches instead.
+  notification-event-consumer:
+    build:
+      context: ./services/notification
+      dockerfile: Dockerfile
+
+    container_name: flowops-notification-event-consumer
+    restart: unless-stopped
+
+    environment:
+      DATABASE_URL: postgresql+asyncpg://notification_user:dev_password@notification-db:5432/notification_db
+      DEBUG: "false"
+      ENVIRONMENT: production
+      RABBITMQ_URL: amqp://flowops:dev_password@rabbitmq:5672/
+      # The exchange is owned by Order; this service only reads it.
+      ORDER_EVENTS_EXCHANGE: order.events
+      # The queue belongs to this consumer: Order declares only the exchange, so
+      # a new consumer appears without a deploy of the producer.
+      EVENT_CONSUMER_QUEUE: notification.order-events
+      EVENT_CONSUMER_DLX_EXCHANGE: notification.order-events.dlx
+      EVENT_CONSUMER_DLQ: notification.order-events.dlq
+      EVENT_CONSUMER_PREFETCH_COUNT: "10"
+      # Deliveries accepted before the runtime refuses the message without
+      # requeue (dead letter). It reads the broker's `x-acquired-count`:
+      # RabbitMQ 4 does not apply `x-delivery-limit` to an explicit requeue.
+      EVENT_CONSUMER_MAX_DELIVERY_COUNT: "5"
+      # One info line per interval: received/duplicates/retried/refused/
+      # dead_lettered. Per-event lines stay at DEBUG.
+      EVENT_CONSUMER_REPORT_INTERVAL_SECONDS: "60.0"
+      # Interruptible pause after a transient failure: without it a database
+      # outage would requeue in a tight loop and exhaust the limit in
+      # milliseconds.
+      EVENT_CONSUMER_REQUEUE_DELAY_SECONDS: "2.0"
+      EVENT_CONSUMER_RECONNECT_DELAY_SECONDS: "5.0"
+
+    depends_on:
+      notification-db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+    # Notification has no API process, so this consumer owns its schema: it
+    # migrates before subscribing. With several replicas, move `alembic upgrade`
+    # to a one-off job (see the migration strategy in docs/architecture.md).
+    command: >
+      sh -c "alembic upgrade head &&
+             python -m app.event_consumer"
+
+    # The callback handles one message at a time, so the safe stop point is the
+    # current commit; the pause after a transient failure is interruptible
+    # (`sleep_or_stop`) and does not delay shutdown.
+    stop_grace_period: 15s
+
+  # The second process of this service: turns recorded inbox rows into
+  # notifications. Same image, different entry point. No broker: it only reads and
+  # updates its own database, and `event_id` travels as the idempotency key. No
+  # `alembic upgrade` either: the consumer owns the schema, and this process
+  # tolerates a not-yet-migrated one by failing a pass and backing off.
+  notification-sender:
+    build:
+      context: ./services/notification
+      dockerfile: Dockerfile
+
+    container_name: flowops-notification-sender
+    restart: unless-stopped
+
+    environment:
+      DATABASE_URL: postgresql+asyncpg://notification_user:dev_password@notification-db:5432/notification_db
+      DEBUG: "false"
+      ENVIRONMENT: production
+      # Invariant checked at start-up: SENDER_LEASE_SECONDS >= 2 *
+      # SENDER_INTERVAL_SECONDS. A pass has to finish before its own lease
+      # expires, otherwise another sender reclaims rows that are still in flight.
+      SENDER_INTERVAL_SECONDS: "5.0"
+      SENDER_BATCH_SIZE: "50"
+      # Also the backoff: a failed send writes nothing, so the row comes back only
+      # when this lease runs out.
+      SENDER_LEASE_SECONDS: "30.0"
+      SENDER_MAX_ATTEMPTS: "10"
+      # Real email in the dev stack: Mailpit accepts every address and shows the
+      # message at http://127.0.0.1:8025, so the composed notification is visible
+      # without an external provider.
+      SENDER_TRANSPORT: smtp
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+      SMTP_FROM: orders@flowops.local
+      SMTP_TIMEOUT_SECONDS: "10.0"
+      RECIPIENT_DOMAIN: flowops.local
+
+    depends_on:
+      notification-db:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+
+    command: python -m app.sender
+
+    # Lease (30) + interval (5): the lease is the design limit on one pass, and
+    # the extra interval is the time the loop needs to notice the stop event.
+    stop_grace_period: 35s
+
+  # Dev mail catcher: the SMTP transport delivers here, and the web UI shows what
+  # a customer would receive. Loopback only, and no healthcheck: the sender
+  # tolerates an SMTP outage through the lease/backoff, so the stack can start in
+  # any order.
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: flowops-mailpit
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:1025:1025"
+      - "127.0.0.1:8025:8025"
+
 volumes:
   inventory_postgres_data:
   identity_postgres_data:
   order_postgres_data:
+  notification_postgres_data:
+  rabbitmq_data:
 
 # File-based secrets for local development. In a real deployment the same two
 # names are provided by Docker Swarm / Kubernetes secret objects, so the
