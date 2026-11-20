@@ -46,6 +46,7 @@ from app.repositories.order import (
     OrderRepositoryPort,
     SqlOrderRepository,
 )
+from app.repositories.outbox import OutboxRepositoryPort, SqlOutboxRepository
 from app.services.reservation import apply_terminal_outcome, fail_exhausted_reservation
 
 logger = logging.getLogger(__name__)
@@ -90,10 +91,16 @@ class Reconciler:
         repository_factory: Callable[
             [AsyncSession], OrderRepositoryPort
         ] = SqlOrderRepository,
+        outbox_factory: Callable[
+            [AsyncSession], OutboxRepositoryPort
+        ] = SqlOutboxRepository,
     ) -> None:
         self._session_factory = session_factory
         self._inventory = inventory
         self._repository_factory = repository_factory
+        #: Same session as the order repository in every TX2, for the same
+        #: reason the API does it: the event must commit with the transition.
+        self._outbox_factory = outbox_factory
         self._batch_size = batch_size
         # Must match the API's value: both processes decide "is this lease
         # stale, i.e. is no call in flight" with the same number, otherwise one
@@ -231,6 +238,7 @@ class Reconciler:
         async with self._session_factory() as session:
             record = await apply_terminal_outcome(
                 repository=self._repository(session),
+                outbox=self._outbox(session),
                 order_id=order_id,
                 reservation=reservation,
             )
@@ -244,6 +252,7 @@ class Reconciler:
         async with self._session_factory() as session:
             record = await fail_exhausted_reservation(
                 repository=self._repository(session),
+                outbox=self._outbox(session),
                 order_id=order_id,
             )
             if record is None:
@@ -271,3 +280,6 @@ class Reconciler:
 
     def _repository(self, session: AsyncSession) -> OrderRepositoryPort:
         return self._repository_factory(session)
+
+    def _outbox(self, session: AsyncSession) -> OutboxRepositoryPort:
+        return self._outbox_factory(session)

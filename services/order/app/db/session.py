@@ -17,6 +17,10 @@ engine = create_async_engine(
 SessionLocal = async_sessionmaker(
     bind=engine,
     class_=AsyncSession,
+    # Not the SQLAlchemy default, and the relay depends on it: `_claim()` closes
+    # its session before publishing, so the events it returns are detached, and
+    # reading `event.attempts` from the failure log would otherwise try to
+    # refresh through a connection that no longer exists.
     expire_on_commit=False,
 )
 

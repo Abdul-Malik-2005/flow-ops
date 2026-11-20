@@ -19,6 +19,7 @@ from app.clients.inventory import ReservationOutcome, ReservationResult
 from app.domain.order import OrderLine, OrderReason
 from app.models.order import Order, OrderStatus
 from app.repositories.order import CancelStatus, OrderCursor, SqlOrderRepository
+from app.repositories.outbox import SqlOutboxRepository
 from app.services.exceptions import (
     IdempotencyConflictError,
     InsufficientStockError,
@@ -87,6 +88,7 @@ async def service(
         yield OrderService(
             session=session,
             repository=SqlOrderRepository(session),
+            outbox=SqlOutboxRepository(session),
             inventory=inventory,
             pricing=NullPricing(),
             currency="RUB",
@@ -167,6 +169,7 @@ async def test_the_order_is_committed_before_inventory_is_called(
         service = OrderService(
             session=session,
             repository=SqlOrderRepository(session),
+            outbox=SqlOutboxRepository(session),
             inventory=inventory,
             pricing=NullPricing(),
             currency="RUB",
@@ -207,6 +210,7 @@ async def test_terminal_refusal_fails_the_order_with_a_reason(
         service = OrderService(
             session=session,
             repository=SqlOrderRepository(session),
+            outbox=SqlOutboxRepository(session),
             inventory=FakeInventory(ReservationResult(outcome)),
             pricing=NullPricing(),
             currency="RUB",
@@ -236,6 +240,7 @@ async def test_unknown_outcome_keeps_the_order_pending(
         service = OrderService(
             session=session,
             repository=SqlOrderRepository(session),
+            outbox=SqlOutboxRepository(session),
             inventory=FakeInventory(ReservationResult(ReservationOutcome.UNAVAILABLE)),
             pricing=NullPricing(),
             currency="RUB",
@@ -419,6 +424,7 @@ async def test_a_cancel_that_wins_the_race_is_not_overwritten(
         service = OrderService(
             session=session,
             repository=SqlOrderRepository(session),
+            outbox=SqlOutboxRepository(session),
             inventory=FakeInventory(before_return=cancel_during_reserve),
             pricing=NullPricing(),
             currency="RUB",

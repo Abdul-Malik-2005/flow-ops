@@ -22,7 +22,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import signal
 import sys
 from collections.abc import Sequence
 
@@ -31,6 +30,7 @@ import httpx
 from app.clients.inventory import InventoryClient
 from app.core.config import settings
 from app.db.session import SessionLocal, engine
+from app.runtime import configure_logging, install_signal_handlers, sleep_or_stop
 from app.services.reconciler import Reconciler, ReconcileReport
 
 logger = logging.getLogger("app.worker")
@@ -74,7 +74,7 @@ async def run_once() -> ReconcileReport:
 async def run_forever(*, stop: asyncio.Event | None = None) -> None:
     """Reconcile until a shutdown signal arrives."""
     stop = stop or asyncio.Event()
-    _install_signal_handlers(stop)
+    install_signal_handlers(stop, logger=logger)
     interval = settings.reconcile_interval_seconds
 
     async with httpx.AsyncClient(
@@ -99,7 +99,7 @@ async def run_forever(*, stop: asyncio.Event | None = None) -> None:
                     if report.claimed:
                         # A backlog: keep draining instead of sleeping.
                         continue
-                await _sleep_or_stop(stop, interval)
+                await sleep_or_stop(stop, interval)
         finally:
             await engine.dispose()
 
@@ -130,30 +130,6 @@ def log_report(report: ReconcileReport) -> None:
         logger.info(message, *arguments)
 
 
-async def _sleep_or_stop(stop: asyncio.Event, seconds: float) -> None:
-    """Sleep, but wake up immediately when a shutdown signal arrives."""
-    try:
-        await asyncio.wait_for(stop.wait(), timeout=seconds)
-    except TimeoutError:
-        pass
-
-
-def _install_signal_handlers(stop: asyncio.Event) -> None:
-    """Turn SIGTERM/SIGINT into "finish the batch and exit 0".
-
-    `signal.signal` instead of `loop.add_signal_handler`: the latter does not
-    exist on Windows, and the worker must be runnable from a developer machine.
-    """
-    loop = asyncio.get_running_loop()
-
-    def _request_stop(signum: int, _frame: object) -> None:
-        logger.info("received signal %s: finishing the current batch", signum)
-        loop.call_soon_threadsafe(stop.set)
-
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, _request_stop)
-
-
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m app.worker",
@@ -175,10 +151,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
-    logging.basicConfig(
-        level=args.log_level,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    configure_logging(args.log_level)
 
     if args.once:
         report = asyncio.run(run_once())

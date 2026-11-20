@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://flowops.local/contracts/order-events.schema.json",
+  "title": "FlowOps order event envelope",
+  "description": "The wire contract of the `order.events` exchange: one message is the JSON of `app.publishers.envelope.encode_event`. Producers validate against it before changing a payload, consumers parse against it instead of importing the producer's code. Money is a string (a JSON number would be parsed as a binary float), ids are strings, and `occurred_at` is nullable because a row that was never committed has no database-assigned timestamp.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "event_id", "event_type", "aggregate_id", "occurred_at", "payload"],
+  "properties": {
+    "schema_version": {
+      "description": "Envelope schema version. A bump denotes a compatible (additive) change an older consumer must tolerate; a breaking change is a new event type (`order.reserved.v2`), not a bump of this field.",
+      "type": "integer",
+      "const": 1
+    },
+    "event_id": {
+      "description": "Also the AMQP `message_id`; consumers deduplicate by it.",
+      "$ref": "#/$defs/uuid"
+    },
+    "aggregate_id": {
+      "description": "The order the event is about; also sent as the `aggregate_id` header.",
+      "$ref": "#/$defs/uuid"
+    },
+    "event_type": {
+      "description": "Also the AMQP routing key and `type` property.",
+      "type": "string",
+      "enum": ["order.reserved", "order.failed", "order.cancelled"]
+    },
+    "occurred_at": {
+      "description": "When the fact committed (the transaction timestamp), not when the relay published it.",
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "payload": {
+      "description": "A JSON-ready snapshot: consumers cannot read the Order database, so everything they need travels here.",
+      "type": "object"
+    }
+  },
+  "oneOf": [
+    {
+      "description": "`pending -> reserved`: stock is held.",
+      "properties": {
+        "event_type": { "const": "order.reserved" },
+        "payload": { "$ref": "#/$defs/orderReservedPayload" }
+      }
+    },
+    {
+      "description": "`pending -> failed`: terminal, with the reason a consumer can act on.",
+      "properties": {
+        "event_type": { "const": "order.failed" },
+        "payload": { "$ref": "#/$defs/orderTerminalPayload" }
+      }
+    },
+    {
+      "description": "`pending -> cancelled`: terminal, cancelled by the customer.",
+      "properties": {
+        "event_type": { "const": "order.cancelled" },
+        "payload": { "$ref": "#/$defs/orderTerminalPayload" }
+      }
+    }
+  ],
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "money": {
+      "description": "A decimal string with the scale the database stores; `null` means unknown, which is not the same as 0.00.",
+      "type": ["string", "null"],
+      "pattern": "^-?[0-9]+\\.[0-9]{2}$"
+    },
+    "orderItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["product_id", "warehouse_id", "quantity"],
+      "properties": {
+        "product_id": { "$ref": "#/$defs/uuid" },
+        "warehouse_id": { "$ref": "#/$defs/uuid" },
+        "quantity": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "orderSnapshot": {
+      "description": "The fields every order event carries, so a consumer parses one shape.",
+      "type": "object",
+      "required": [
+        "order_id",
+        "user_id",
+        "status",
+        "currency",
+        "total_amount",
+        "items"
+      ],
+      "properties": {
+        "order_id": { "$ref": "#/$defs/uuid" },
+        "user_id": { "$ref": "#/$defs/uuid" },
+        "status": {
+          "description": "The order status after the transition; kept as a plain string so a new status is not a schema change.",
+          "type": "string",
+          "minLength": 1
+        },
+        "currency": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$"
+        },
+        "total_amount": { "$ref": "#/$defs/money" },
+        "items": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/orderItem" }
+        }
+      }
+    },
+    "orderReservedPayload": {
+      "allOf": [
+        { "$ref": "#/$defs/orderSnapshot" },
+        {
+          "type": "object",
+          "required": ["inventory_reservation_id"],
+          "properties": {
+            "inventory_reservation_id": {
+              "description": "The Inventory reservation that holds the stock; a consumer needs it to confirm or release.",
+              "type": ["string", "null"],
+              "format": "uuid"
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "orderTerminalPayload": {
+      "allOf": [
+        { "$ref": "#/$defs/orderSnapshot" },
+        {
+          "type": "object",
+          "required": ["reason"],
+          "properties": {
+            "reason": {
+              "description": "Why the order is terminal. The set of reasons lives in the domain, not here: a new one is not a contract change.",
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    }
+  }
+}

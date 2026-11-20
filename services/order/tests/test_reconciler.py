@@ -18,6 +18,7 @@ from app.clients.inventory import ReservationOutcome, ReservationResult
 from app.domain.order import OrderLine, OrderReason
 from app.models.order import Order, OrderStatus
 from app.models.order_item import OrderItem
+from app.models.outbox_event import OutboxEvent
 from app.repositories.order import OrderRecord
 from app.services.reconciler import Reconciler, ReconcileReport
 
@@ -132,6 +133,16 @@ class FakeRepository:
         return record
 
 
+class FakeOutbox:
+    """Records staged events: the real adapter only adds them to the session."""
+
+    def __init__(self) -> None:
+        self.events: list[OutboxEvent] = []
+
+    async def enqueue(self, *, event: OutboxEvent) -> None:
+        self.events.append(event)
+
+
 class FakeInventory:
     def __init__(
         self,
@@ -188,13 +199,16 @@ def build_reconciler(
     inventory: FakeInventory,
     *,
     repository: FakeRepository | None = None,
+    outbox: FakeOutbox | None = None,
 ) -> tuple[Reconciler, FakeRepository, FakeSessionFactory]:
     sessions = FakeSessionFactory()
     repository = repository or FakeRepository(records)
+    outbox = outbox or FakeOutbox()
     reconciler = Reconciler(
         session_factory=sessions,
         inventory=inventory,
         repository_factory=lambda _session: repository,
+        outbox_factory=lambda _session: outbox,
         batch_size=BATCH_SIZE,
         stale_after_seconds=STALE_AFTER,
         max_attempts=MAX_ATTEMPTS,
@@ -368,3 +382,57 @@ async def test_stale_backlog_is_counted_once_per_pass() -> None:
 
     assert report == ReconcileReport(stale_backlog=3)
     assert repository.backlog_seconds == [ALERT_AFTER]
+
+
+# ---------------------------------------------------------------------------
+# Outbox emission
+# ---------------------------------------------------------------------------
+
+
+async def test_a_winning_transition_stages_exactly_one_event() -> None:
+    record = make_record()
+    outbox = FakeOutbox()
+    reconciler, _, sessions = build_reconciler(
+        [record],
+        FakeInventory(),
+        outbox=outbox,
+    )
+
+    await reconciler.process_batch()
+
+    assert [event.event_type for event in outbox.events] == ["order.reserved"]
+    assert outbox.events[0].aggregate_id == record.order.id
+    # Staged inside TX2, before the commit that made the transition durable.
+    assert sessions.sessions[1].commits == 1
+
+
+async def test_a_lost_race_against_a_cancel_stages_nothing() -> None:
+    record = make_record()
+    repository = FakeRepository([record])
+    repository.cancelled.add(record.order.id)
+    outbox = FakeOutbox()
+    reconciler, _, _ = build_reconciler(
+        [record],
+        FakeInventory(),
+        repository=repository,
+        outbox=outbox,
+    )
+
+    await reconciler.process_batch()
+
+    # No transition means no fact: publishing here would announce a status the
+    # order never had.
+    assert outbox.events == []
+
+
+async def test_an_exhausted_budget_stages_a_failed_event() -> None:
+    record = make_record(attempts=MAX_ATTEMPTS)
+    outbox = FakeOutbox()
+    reconciler, _, _ = build_reconciler([record], FakeInventory(), outbox=outbox)
+
+    await reconciler.process_batch()
+
+    assert [event.event_type for event in outbox.events] == ["order.failed"]
+    assert outbox.events[0].payload["reason"] == (
+        OrderReason.RESERVATION_UNAVAILABLE.value
+    )

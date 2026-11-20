@@ -17,8 +17,9 @@ import httpx
 import pytest
 
 from app.core.config import settings
+from app.runtime import sleep_or_stop
 from app.services.reconciler import ReconcileReport
-from app.worker import _parse_args, _sleep_or_stop, build_reconciler, log_report
+from app.worker import _parse_args, build_reconciler, log_report
 
 
 async def test_build_reconciler_wires_every_setting() -> None:
@@ -69,4 +70,4 @@ async def test_a_pending_shutdown_interrupts_the_sleep() -> None:
     stop = asyncio.Event()
     stop.set()
 
-    await _sleep_or_stop(stop, seconds=30.0)
+    await sleep_or_stop(stop, seconds=30.0)

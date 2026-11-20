@@ -14,6 +14,10 @@ The sequence for a new order is fixed:
 
 An unknown answer (timeout, 5xx) keeps the order `pending` on purpose: Inventory
 is idempotent by `order_id`, so a retry is safe and `failed` would be a lie.
+
+Every committed terminal transition also stages one outbox row in the *same*
+transaction (transactional outbox): a rollback drops the status change and its
+event together, and the relay only ever sees facts that really happened.
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ from app.clients.inventory import (
     ReservationOutcome,
     ReservationResult,
 )
+from app.domain.events import order_cancelled
 from app.domain.order import (
     OrderLine,
     OrderReason,
@@ -45,6 +50,7 @@ from app.repositories.order import (
     OrderRecord,
     OrderRepositoryPort,
 )
+from app.repositories.outbox import OutboxRepositoryPort
 from app.services.exceptions import (
     IdempotencyConflictError,
     InsufficientStockError,
@@ -78,6 +84,7 @@ class OrderService:
         *,
         session: AsyncSession,
         repository: OrderRepositoryPort,
+        outbox: OutboxRepositoryPort,
         inventory: InventoryClientPort,
         pricing: PricingPort,
         currency: str,
@@ -85,6 +92,9 @@ class OrderService:
     ) -> None:
         self._session = session
         self._repository = repository
+        #: Shares the session with the order repository, so `enqueue` joins the
+        #: transaction that records the status change it describes.
+        self._outbox = outbox
         self._inventory = inventory
         self._pricing = pricing
         self._currency = currency
@@ -232,6 +242,7 @@ class OrderService:
 
         record = await apply_terminal_outcome(
             repository=self._repository,
+            outbox=self._outbox,
             order_id=order_id,
             reservation=reservation,
         )
@@ -335,9 +346,20 @@ class OrderService:
             await self._session.rollback()
             raise OrderNotCancellableError(order_id)
 
-        await self._session.commit()
         if result.record is None:  # pragma: no cover - cancelled implies a record
+            await self._session.rollback()
             raise OrderNotFoundError(order_id)
+
+        # Only a *new* cancellation is a fact. `NOT_CANCELLABLE` and a missing
+        # row returned earlier, and a replay of the same request cannot reach
+        # this point: `pending` is gone, so the update no longer matches.
+        await self._outbox.enqueue(
+            event=order_cancelled(
+                record=result.record,
+                reason=reason,
+            ).to_outbox_event(),
+        )
+        await self._session.commit()
         return result.record
 
 

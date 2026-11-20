@@ -15,6 +15,7 @@ from app.core.config import settings
 from app.core.security import InvalidTokenError, Principal, decode_access_token
 from app.db.session import get_session
 from app.repositories.order import SqlOrderRepository
+from app.repositories.outbox import SqlOutboxRepository
 from app.services.order import OrderService
 from app.services.pricing import NullPricing
 
@@ -105,10 +106,14 @@ async def get_order_service(
     Everything here is cheap or request-scoped: the session is per request, the
     HTTP pool is shared, and the currency/lease come from settings. Tests override
     this dependency instead of patching modules.
+
+    The outbox repository gets the *same* session as the order repository: that
+    is the whole point of the pattern, since both writes must commit together.
     """
     return OrderService(
         session=session,
         repository=SqlOrderRepository(session),
+        outbox=SqlOutboxRepository(session),
         inventory=inventory,
         pricing=NullPricing(),
         currency=settings.default_currency,

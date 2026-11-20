@@ -37,7 +37,9 @@ from tests.integration.helpers import (
 )
 
 _TRUNCATE = text(
-    "TRUNCATE TABLE order_status_history, order_items, orders RESTART IDENTITY CASCADE"
+    "TRUNCATE TABLE order_event_projections, outbox_events, "
+    "order_status_history, order_items, orders "
+    "RESTART IDENTITY CASCADE"
 )
 
 

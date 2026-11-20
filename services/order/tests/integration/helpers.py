@@ -22,7 +22,9 @@ from app.domain.order import OrderLine, canonical_request_hash, normalize_lines
 from app.models.order import Order, OrderStatus
 from app.models.order_item import OrderItem
 from app.models.order_status_history import OrderStatusHistory
+from app.models.outbox_event import OutboxEvent
 from app.repositories.order import OrderRecord, SqlOrderRepository
+from app.repositories.outbox import SqlOutboxRepository
 
 SERVICE_ROOT = Path(__file__).resolve().parents[2]
 TEST_DATABASE_SUFFIX = "_test_db"
@@ -208,3 +210,72 @@ async def history_of(
 async def count_orders(session_factory: async_sessionmaker[AsyncSession]) -> int:
     async with session_factory() as session:
         return await session.scalar(select(func.count()).select_from(Order)) or 0
+
+
+async def insert_outbox_event(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    event_type: str = "order.reserved",
+    aggregate_id: uuid.UUID | None = None,
+    payload: dict[str, object] | None = None,
+    attempts: int | None = None,
+    occurred_at: datetime | None = None,
+) -> uuid.UUID:
+    """Write one outbox row outside the service, already committed.
+
+    Bypasses the payload builders on purpose: these tests are about storage
+    semantics, and a hand-built row proves the repository does not depend on the
+    shape of the domain event.
+    """
+    event_id = uuid.uuid4()
+    aggregate = aggregate_id or uuid.uuid4()
+    event = OutboxEvent(
+        id=event_id,
+        aggregate_id=aggregate,
+        event_type=event_type,
+        payload=payload if payload is not None else {"order_id": str(aggregate)},
+    )
+    if attempts is not None:
+        event.attempts = attempts
+    if occurred_at is not None:
+        event.occurred_at = occurred_at
+
+    async with session_factory() as session:
+        await SqlOutboxRepository(session).enqueue(event=event)
+        await session.commit()
+
+    return event_id
+
+
+async def age_outbox_lease(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    event_id: uuid.UUID,
+    seconds: float,
+) -> None:
+    """Move `locked_at` into the past: a lease the publisher never came back from.
+
+    Uses the database clock, so the staleness predicate under test is exactly the
+    one the relay runs.
+    """
+    async with session_factory() as session:
+        await session.execute(
+            update(OutboxEvent)
+            .where(OutboxEvent.id == event_id)
+            .values(
+                locked_at=func.now()
+                - text("make_interval(secs => :seconds)").bindparams(seconds=seconds)
+            )
+        )
+        await session.commit()
+
+
+async def outbox_rows(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> list[OutboxEvent]:
+    """Every outbox row, oldest first — the way a consumer would see them."""
+    async with session_factory() as session:
+        rows = await session.scalars(
+            select(OutboxEvent).order_by(OutboxEvent.occurred_at, OutboxEvent.id)
+        )
+        return list(rows)
