@@ -1,95 +1,85 @@
 # FlowOps — Текущий статус (Current Handoff)
 
-**Актуальный сервис:** `services/order` — блоки 1–7 закрыты, **блок 8 (RabbitMQ) закрыт полностью**: транспорт → консьюмер-журнал → флип публикации → наблюдаемость → переигрывание DLQ.
-**Статус:** 401 passed / 0 skipped (314 unit/API + 87 интеграционных) при `REQUIRE_INTEGRATION_TESTS=1` и `ORDER_RABBITMQ_IT=1` на живых Postgres + RabbitMQ; без флагов RabbitMQ-модули скипаются целиком. `ruff check`/`ruff format --check` чисто (96 файлов). Alembic head `a7c9e1f4b2d6`; `docker compose config --quiet` валиден.
-**Следующая задача:** блок 9 — выбрать между межсервисным потребителем (Notification) и эксплуатационной зрелостью Order. `services/inventory` **не трогать**: журнал внутри Order задуман как read-side и остаётся.
+**Актуальные сервисы:** `services/order` (блоки 1–8) и `services/notification` (блок 9) — **блок 9 закрыт полностью**: межсервисный консьюмер → sender → SMTP/Mailpit → `schema_version` → сквозной E2E → DLQ-replay → `--once`/readiness.
+**Статус:** Order **409 passed / 0 skipped**; Notification **154 passed / 0 skipped** (живые Postgres + RabbitMQ + Mailpit). `ruff check`/`format --check` чисто (Order 96, Notification 51 файл). Alembic: Order `a7c9e1f4b2d6`, Notification `c2d8e3a5b914`; `docker compose config --quiet` валиден.
+**Git:** `main` = `208653c`, всё запушено. `services/inventory` **не трогать**.
+**Следующая задача:** новый блок — Catalog (прайсинг) или дописать Identity (см. план).
 
 ---
 
-## Что готово
+## Что готово (сжато)
 
-### Блоки 1–6 (сжато)
-- Сага `order-first`: TX1 (`INSERT pending` + history) → COMMIT → HTTP `reserve` → TX2 (исход + lease); идемпотентность по `Idempotency-Key` + телу (200 / 409); недоступность Inventory → 202, заказ остаётся `pending`.
-- Lease `reservation_started_at` защищает отмену от гонки с reserve; реконсилер — claim-by-lease (`FOR UPDATE SKIP LOCKED`), HTTP вне транзакции, TX2 = CAS `WHERE status='pending'`.
-- API `/api/v1/orders`: POST, GET list (keyset), GET one, POST `{id}/cancel`; access-токен проверяется локально, `user_id` только из `sub`.
+### Блоки 1–8 (Order) — 3 тезиса
+1. **Сага `order-first`:** TX1 (`INSERT pending` + history) → commit → HTTP `reserve` → TX2 (исход + lease); идемпотентность `Idempotency-Key`+тело (200/409); недоступность Inventory → 202/pending; реконсилер claim-by-lease (`FOR UPDATE SKIP LOCKED`).
+2. **Outbox + RabbitMQ:** событие пишется в транзакции смены статуса; `python -m app.outbox_relay` = claim → publish вне tx (durable topic `order.events`, routing key = `event_type`, confirms + `mandatory`) → `mark_published` CAS; at-least-once, дедуп по `event_id`. `python -m app.event_consumer` журналирует (`order_event_projections`), commit→ack, `EventHandlingError`→DLQ, предел по `x-acquired-count`.
+3. **Версионирование:** `schema_version` в конверте (`SCHEMA_VERSION=1` в `app/domain/events.py`), общий контракт `contracts/order-events.schema.json`; контрактные тесты пинят ключи/enum/версию.
 
-### Блок 7 (outbox) — три тезиса
-1. **Событие пишется в той же транзакции**, что и смена статуса; наружу его выносит `python -m app.outbox_relay`: TX1 claim (`FOR UPDATE SKIP LOCKED`, `attempts += 1`, lease) → публикация **вне транзакции** → TX2 `mark_published` (CAS) → TX3 `count_exhausted`. At-least-once, дедуп по `event_id`; `RelayReport` — единственная наблюдаемость.
-2. **Политика цикла:** дренаж без сна только пока `published >= claimed * 0.5`; падение прохода → экспоненциальный `pass_backoff` (потолок 300 с); dead letters читаются лишь когда счёт мог измениться, ERROR — на рост числа.
-3. **Рантайм:** `app/runtime.py` общий для воркера, relay и консьюмера (лог, `signal.signal` → `asyncio.Event`, `sleep_or_stop`); compose-сервис `order-outbox-relay` — тот же образ, `stop_grace_period: 35s`, после флипа зависит от `order-db` и `rabbitmq`.
+### Блок 9 (Notification) — 3 тезиса
+1. **Консьюмер (`python -m app.event_consumer`):** новый сервис со своей БД, inbox-паттерн (`notification_inbox`, PK=`event_id`, `ON CONFLICT DO NOTHING`), своя durable очередь `notification.order-events` + свой DLX/DLQ, allow-list биндингов; `commit→ack`, дубль=успех, `EventHandlingError`→DLQ, transient→requeue. Order не менялся.
+2. **Sender (`python -m app.sender`):** claim (`FOR UPDATE SKIP LOCKED`, `attempts+=1`, lease) → compose+resolve+send **вне** tx → `mark_sent` CAS; порт `NotificationSenderPort`; composer (шаблоны по типу), `RecipientResolverPort` (`user_id→email`, dev `LocalRecipientResolver`), SMTP (`aiosmtplib`, dev Mailpit), `SENDER_TRANSPORT=log|smtp`; `event_id` = `Message-ID`.
+3. **Контракт/операции:** `schema_version` обязателен (int≥1, higher толерится); сквозной E2E `scripts/e2e_order_to_notification.py`; DLQ-replay **в свою очередь** через default exchange; `--once` drain + `idle_s` heartbeat.
 
-### Блок 8, шаг 3 (RabbitMQ-транспорт) — три тезиса
-1. **Второй адаптер за тем же портом:** `RabbitMQEventPublisher` (`aio-pika 10.2.3`, `connect_robust`) включается `OUTBOX_PUBLISHER=rabbitmq` + `RABBITMQ_URL`; код-дефолт `log` остаётся для запусков без инфраструктуры (pytest, локальный `--once`).
-2. **Контракт публикации:** durable topic exchange `OUTBOX_EXCHANGE` (`order.events`), routing key = `event_type`, `delivery_mode=PERSISTENT` + confirms + `mandatory=True` + `on_return_raises=True`; `Nack`/`Reject`/`Basic.Return` → `EventNotDelivered` → строка остаётся `published_at IS NULL`.
-3. **Инфраструктура:** `rabbitmq:4-management-alpine` (healthcheck `rabbitmq-diagnostics -q ping`, порты только на localhost); 18 unit-тестов на фейках с инъекцией `connect`; живой брокер — `tests/integration/test_rabbitmq_publisher.py`.
+## Тесты
+- **Order:** 409 passed (unit/API + интеграционные: заказы, сага, outbox, relay, реконсилер, консьюмер, DLQ replay, publisher, outbox→журнал).
+- **Notification:** 154 passed (unit: config/handler/repo/consumer/entrypoint/sender/composer/resolver/smtp/dlq_replay; интеграционные: inbox repo, consumer E2E, sender, SMTP→Mailpit, DLQ replay; контракт).
+- Гейты: `REQUIRE_INTEGRATION_TESTS=1`; RabbitMQ `ORDER_RABBITMQ_IT=1` / `NOTIFICATION_RABBITMQ_IT=1` + `RABBITMQ_URL`; SMTP `NOTIFICATION_SMTP_IT=1` + `SMTP_HOST/PORT`. Без флагов интеграционные скипаются.
 
-### Блок 8, шаг 4 (консьюмер-журнал) — три тезиса
-1. **Схема:** `order_event_projections` (append-only), PK = `event_id` (= AMQP `message_id` = `outbox_events.id`), `event_type varchar(64)`, `occurred_at timestamptz NULL`, `received_at server_default now()`, индекс `(aggregate_id, occurred_at)`, **без FK** на `orders`/`outbox_events`. Миграция `a7c9e1f4b2d6` (down `f4b8c1d2e903`), цикл `upgrade → check → downgrade -1 → upgrade → check` проверен.
-2. **Репозиторий:** `ProjectionRepositoryPort` + `SqlProjectionRepository.record(...) -> bool` — один `pg_insert(...).on_conflict_do_nothing(index_elements=[event_id]).returning(event_id)`; `False` = повтор, `True` = вставили. Никогда не коммитит, не делает `SELECT`-then-`INSERT` (race) и не ловит `IntegrityError` (aborted-транзакция).
-3. **Обработчик:** `OrderEventProjector.handle(message) -> bool` — чистый, без сессии/ack/брокера. Allow-list = `OrderEventType`; неизвестный тип → `UnsupportedEventTypeError`, битый конверт → `MalformedEventError` (оба — `EventHandlingError` → DLQ). Лишние поля конверта игнорируются (forward compatibility), `occurred_at: null` допустим, naive timestamp отвергается; ошибки разбора не доходят до БД.
-
-### Блок 8, шаг 5 (рантайм, флип, наблюдаемость, replay) — три тезиса
-1. **Рантайм:** `python -m app.event_consumer`, compose-сервис `order-event-consumer` (без портов, `depends_on` order-db + rabbitmq, `stop_grace_period: 15s`). Объявляет durable **quorum** очередь, DLX + DLQ, allow-list биндингов из `OrderEventType`; exchange переобъявляется идемпотентно. `commit` строго до `ack`; дубликат тоже ack; `EventHandlingError` → `nack(requeue=False)` → DLQ; временная ошибка → `nack(requeue=True)` + прерываемая пауза. Предел доставок проверяется по заголовку брокера `x-acquired-count`, потому что RabbitMQ 4 **не применяет** `x-delivery-limit` к явному requeue.
-2. **Флип:** в compose `OUTBOX_PUBLISHER=rabbitmq` и `depends_on: rabbitmq`; код-дефолт `log` сохранён, чтобы API не требовал брокер. E2E `tests/integration/test_outbox_to_journal.py`: outbox → релей → брокер → консьюмер → журнал, `published_at` ставится только после confirm.
-3. **Наблюдаемость и replay:** периодический `consumer report` (`processed/duplicates/retried/refused/dead_lettered`, per-event логи в DEBUG, `report(force=True)` на SIGTERM). `python -m app.dlq_replay --limit N`: publish с confirm + `mandatory=True` → только потом ack; routing key из `event_type`; заголовки брокера не копируются; коды выхода 0 / 2 (осталось человеку) / 1 (publish отказал).
-
-## Тесты (314 unit/API + 87 интеграционных)
-
-- **Unit:** новые — `test_event_consumer_entrypoint` 24, `test_rabbitmq_consumer` 11, `test_dlq_replay` 8, `test_event_projection` 23, `test_projection_repository` 2, `test_config` 32; остальные — домен, API, publisher/relay, клиент Inventory и т.д.
-- **Интеграционные:** заказы 24, сага 14, outbox-репозиторий 12, эмиссия 8, relay 6, реконсилер 6, журнал проекций 3, консьюмер 5, outbox→журнал 1, DLQ replay 2, RabbitMQ publisher 3, relay→брокер 3.
-- Без `TEST_DATABASE_URL` интеграционные тихо скипаются; `REQUIRE_INTEGRATION_TESTS=1` превращает skip в падение. RabbitMQ-модули — отдельный гейт `ORDER_RABBITMQ_IT=1` + `RABBITMQ_URL`. `order_event_projections` включена в `TRUNCATE`.
-
-## Ключевые файлы блока 8
+## Ключевые файлы блока 9
 
 ```
-services/order/app/publishers/{rabbitmq,envelope,log}.py, app/consumers/rabbitmq.py
-services/order/app/event_consumer.py                 # commit→ack, лимит доставок, report
-services/order/app/dlq_replay.py                     # ручное переигрывание DLQ
-services/order/app/services/event_projection.py      # чистый обработчик + EventHandlingError
-services/order/app/repositories/projection.py        # ON CONFLICT adapter
-services/order/app/models/, migrations/versions/a7c9e1f4b2d6_*.py
-services/order/app/core/config.py, .env.example, compose.yaml
-contracts/order-events.schema.json, docs/architecture.md (блок 8)
+services/notification/app/{event_consumer,sender,dlq_replay,runtime}.py
+services/notification/app/consumers/rabbitmq.py
+services/notification/app/repositories/inbox.py
+services/notification/app/services/{event_handler,notification_sender,recipient_resolver}.py
+services/notification/app/domain/{events,notifications}.py, senders/{log,smtp}.py
+services/notification/migrations/versions/{b1e4f7a2c803,c2d8e3a5b914}_*.py
+scripts/e2e_order_to_notification.py, docker/notification/, compose.yaml (mailpit + notification-*)
+contracts/order-events.schema.json (schema_version)
 ```
 
-## План следующего шага (блок 9)
+## План следующего шага
 
-- **A. Межсервисный потребитель Notification** (крупный блок, рекомендуется): новый сервис `services/notification` со своей БД, durable очередь `notification.order-events`, allow-list биндингов, дедуп по `event_id`, DLX/DLQ, собственный аналог журнала. Order не меняется вовсе — очередь объявляет её владелец. Это первая настоящая проверка контракта между сервисами.
-- **B. Эксплуатационная зрелость Order** (дешевле, без нового сервиса): health/readiness консьюмера (время последней успешной обработки), `--once` для smoke, healthcheck для `order-event-consumer`, алерты по `refused/dead_lettered`, structured logs.
-- **C. Версионирование контракта:** `schema_version` в конверте + тесты совместимости до появления второго потребителя.
+- **A. Catalog** (прайсинг): новый сервис; Order получает цены (`PricingPort` вместо `NullPricing`), `total_amount` перестаёт быть NULL. Крупный блок.
+- **B. Дописать Identity:** завершить auth, затем заменить `LocalRecipientResolver` на HTTP-резолвер (`user_id→email` из Identity). Разблокирует настоящую доставку по адресу.
 
 **Вопросы к согласованию:**
-1) следующий блок: A (Notification) или B (зрелость Order)?
-2) если A: Notification сразу с собственной БД (миграции, compose) или сначала тонкий консьюмер без БД?
-3) нужен ли `schema_version` (C) до второго потребителя или после?
-4) DLQ replay: оставить ручным CLI или добавить расписание/операторскую обёртку?
+1) следующий блок: A (Catalog) или B (Identity)?
+2) если Catalog: цены тянуть синхронно из Order (`PricingPort` → HTTP) или событием/кэшем?
+3) если Identity: достаточно ли JWKS-эндпоинта вместо раздачи публичного ключа через `.env`?
+4) `IdentityRecipientResolver`: синхронный HTTP на каждое письмо или кэш адресов?
 
 ## Команды
 
 ```
-# из корня репозитория
-docker compose up -d order-db rabbitmq
+# из корня
+docker compose up -d                      # стек: dbs, rabbitmq, mailpit, api, consumer, sender, relay
+cd services/order && poetry run alembic upgrade head && poetry run alembic check
 
-cd services/order
-poetry run alembic upgrade head && poetry run alembic check
-poetry run ruff check . ; poetry run ruff format --check .
+# Order
 $env:TEST_DATABASE_URL='postgresql+asyncpg://order_user:dev_password@localhost:5434/order_test_db'
 $env:ORDER_RABBITMQ_IT='1'; $env:RABBITMQ_URL='amqp://flowops:dev_password@localhost:5672/'
-$env:REQUIRE_INTEGRATION_TESTS='1'; poetry run pytest -q      # 401 passed
-poetry run python -m app.dlq_replay --limit 100               # операция, не тест
-```
+$env:REQUIRE_INTEGRATION_TESTS='1'; poetry run pytest -q      # 409 passed
 
-`TEST_DATABASE_URL` в `.env` **нет** (только в `.env.example`) — задавать переменной окружения явно, иначе интеграционные тихо скипнутся.
+# Notification
+cd ../notification && poetry run alembic upgrade head && poetry run alembic check
+$env:TEST_DATABASE_URL='postgresql+asyncpg://notification_user:dev_password@localhost:5435/notification_test_db'
+$env:NOTIFICATION_RABBITMQ_IT='1'; $env:NOTIFICATION_SMTP_IT='1'; $env:SMTP_HOST='localhost'; $env:SMTP_PORT='1025'
+$env:REQUIRE_INTEGRATION_TESTS='1'; poetry run pytest -q      # 154 passed
+poetry run python -m app.event_consumer --once                # smoke: drain + heartbeat
+poetry run python -m app.sender --once                        # smoke: отправка
+poetry run python -m app.dlq_replay --limit 100               # операция
+cd ../../services/order && poetry run python ../../scripts/e2e_order_to_notification.py  # сквозной E2E
+```
+`TEST_DATABASE_URL` в `.env` нет — задавать переменной. Mailpit UI: http://127.0.0.1:8025.
 
 ## Подводные камни
+- **`commit` строго до `ack`;** дубль=успех; консьюмер никогда не публикует; детерминированная ошибка → DLQ, временная → requeue; `services/inventory` не трогать.
+- **`x-delivery-limit` не применяется к явному `nack(requeue=True)`** — рабочий счётчик `x-acquired-count`; на последней доставке рантайм делает `nack(requeue=False)`.
+- **`passive` declare на занятом канале — устаревшая глубина** → читать свежим соединением (тесты и `--once` drain).
+- **`x-death`/`x-acquired-count` не копировать при replay**; consumer-side DLQ-replay идёт в **свою очередь** (default exchange), не в чужой `order.events`.
+- **Пересобирать образы после кода/миграций:** устаревший order-образ падает на `alembic upgrade` («Can't locate revision»), а релей без `schema_version` → Notification уходит в DLQ.
+- **`schema_version`:** требовать наличие/int≥1, higher толерится; breaking — новый тип события; контрактный тест пинит `SCHEMA_VERSION == schema.const`.
+- **SMTP:** `aiosmtplib` с ленивым переиспользуемым соединением; `Message-ID = event_id`; Mailpit — только dev; `smtp` требует `SMTP_HOST`+`SMTP_FROM` (валидатор).
+- **`SENDER_LEASE_SECONDS >= 2 * SENDER_INTERVAL_SECONDS`**; `requires-python >=3.14`; документы только редактором (BOM/CRLF); интеграционные не параллелить на одной `*_test_db` (`DROP SCHEMA`+upgrade на сессию).
+- Windows: `signal.signal`; порты :5432–:5435, :8000/:8001/:8002, :5672/:15672, :1025/:8025 (localhost). Репозитории не коммитят; partial-индексы содержат литералы статусов.
 
-- **`commit` строго до `ack`;** ack дубликата — успех; консьюмер никогда не публикует; детерминированная ошибка → DLQ, временная → requeue; `services/inventory` не трогать.
-- **`x-delivery-limit` не применяется к явному `nack(requeue=True)`** (проверено: 1368 доставок, DLQ пуст). Рабочий счётчик — `x-acquired-count`; на последней разрешённой доставке рантайм делает `nack(requeue=False)`.
-- **`passive` declare на уже использованном канале отдаёт устаревшую глубину** (same channel 0, другое соединение 1) — в тестах читать свежим соединением.
-- **`mandatory=True` без очереди = ошибка публикации:** флип сделан только после появления консьюмера; код-дефолт `log` — для запусков без брокера.
-- **`x-death`/`x-acquired-count` нельзя копировать при replay** — новый консьюмер увидит исчерпанный бюджет и сразу отправит сообщение в DLQ.
-- **`PublishError` — подкласс `DeliveryError`:** `except PublishError` идёт первым; оба нельзя собрать без AMQP-фреймов — в тестах только через `pamqp`. `connect_robust` не переигрывает упавшие публикации.
-- **BLE001:** ruff требует `exc_info=True` у `logger.*` внутри `except Exception` (иначе «do not catch blind exception») — проверено на `dlq_replay._close`.
-- **`requires-python = ">=3.14,<4"`**; `OUTBOX_LEASE_SECONDS >= 2 * OUTBOX_RELAY_INTERVAL_SECONDS`; `expire_on_commit=False`.
-- **Документы править только редактором** (иначе BOM/CRLF); интеграционные тесты не параллелить на одной `*_test_db` (`DROP SCHEMA` + `alembic upgrade head` на сессию).
-- Windows: `signal.signal`, не `loop.add_signal_handler`; порты :5434/:8002/:5672/:15672 (localhost); relay не зависит от `order-api`. Репозитории **никогда не коммитят**; partial-индексы содержат `'pending'`; `HTTP_422_UNPROCESSABLE_CONTENT`; маршруты через `app.openapi()["paths"]`; длинный вывод pytest читать через файл.

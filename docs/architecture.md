@@ -107,7 +107,22 @@
 
 ---
 
-## 6. Бэклог технических решений (на будущие сервисы)
+## 6. Архитектурные решения: Notification Service (блок 9)
+- **Изоляция:** отдельный сервис со своей БД; Order не менялся — очередь объявляет её владелец. Общий артефакт — только `contracts/order-events.schema.json` (консьюмер не импортирует код Order).
+- **Inbox-паттерн (не projection):** `notification_inbox` — транзакционный вход; at-least-once брокера превращается в exactly-once обработки через `INSERT ... ON CONFLICT (event_id) DO NOTHING`. Колонки: `event_id` PK, `aggregate_id`, `event_type varchar(64)`, `payload jsonb`, `occurred_at timestamptz NULL`, `received_at`; состояние доставки `sent_at`/`locked_at`/`attempts`. Partial-индекс `(occurred_at, event_id) WHERE sent_at IS NULL`. Без FK на Order. Миграции `b1e4f7a2c803`, `c2d8e3a5b914`.
+- **Два процесса из одного образа:** `python -m app.event_consumer` (журналирование) и `python -m app.sender` (доставка). Sender: claim (`FOR UPDATE SKIP LOCKED`, `attempts+=1`, lease) → отправка **вне** транзакции → `mark_sent` (CAS) → `count_exhausted_unsent`; lease = backoff; at-least-once.
+- **Порт и адаптеры:** `NotificationSenderPort.send(event_id, message)`; чистый composer (шаблоны по типу) + `RecipientResolverPort` (`user_id→email`; dev `LocalRecipientResolver`; настоящий — HTTP к Identity); адаптеры `LogNotificationSender` / `SmtpNotificationSender` (`SENDER_TRANSPORT=log|smtp`). `event_id` = SMTP `Message-ID` (идемпотентность у провайдера).
+- **Версионирование контракта:** `schema_version` обязателен (int≥1); консьюмеры требуют наличие/тип, но **толерируют higher** (совместимый bump — см. §5); breaking — новый тип события. Контрактный тест пинит `SCHEMA_VERSION == schema.const`.
+- **Consumer-side DLQ-replay:** `python -m app.dlq_replay --limit N` переигрывает **в свою очередь** через default exchange (routing key = имя очереди), **не** в `order.events` — чтобы не ретранслировать dead-letter в другие очереди; `publish` confirm+mandatory → потом ack; заголовки брокера не копируются.
+- **Операции:** `--once` (drain по свежему соединению) для консьюмера и sender; `consumer report` — **heartbeat** (логируется каждый интервал, даже пустой) с `idle_s` (время с последнего успешного `commit→ack`). Контейнерный healthcheck для фоновых процессов сознательно не добавляется («процесс жив» ≠ «бэклог движется»).
+- **Грабли (блок 9):**
+  - Пересобирать образы после изменения кода/миграций: устаревший order-образ падает на `alembic upgrade` («Can't locate revision») и его релей не эмитит `schema_version` → Notification dead-letter'ит.
+  - `passive` declare на занятом канале отдаёт устаревшую глубину → `--once` и тесты читают свежим соединением.
+  - `report()` теперь heartbeat: без этого «пусто» выглядело бы как «мёртв».
+
+---
+
+## 7. Бэклог технических решений (на будущие сервисы)
 - **JWKS-эндпоинт:** Внедрить при появлении следующих сервисов, чтобы не раздавать публичный ключ через `.env`.
 - **Rate Limiting:** Добавить защиту `/auth/login` (sliding window / token bucket) после внедрения Redis.
 - **Маскирование 422 ошибок:** Настроить кастомный обработчик `RequestValidationError`, чтобы вычищать поле `input` с паролями из ответов и логов.
