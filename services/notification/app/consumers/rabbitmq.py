@@ -171,6 +171,42 @@ class RabbitMQEventConsumer:
             self._max_delivery_count,
         )
 
+    async def drained(self) -> bool:
+        """Whether the subscribed queue has no ready messages.
+
+        Used by `--once`: subscribe, drain, exit. The depth is read over a *fresh*
+        short-lived connection, because a passive declare on the channel that is
+        already consuming reports a stale depth. A queue that does not exist yet
+        (the very first start) is treated as "not drained", not as an error.
+        """
+        try:
+            connection = await self._connect(
+                self._url,
+                timeout=self._connect_timeout,
+            )
+        except Exception:
+            logger.warning("could not connect to read the queue depth", exc_info=True)
+            return False
+        try:
+            channel = await connection.channel()
+            queue = await channel.declare_queue(
+                self._queue_name,
+                durable=True,
+                passive=True,
+            )
+            return queue.declaration_result.message_count == 0
+        except Exception:
+            logger.warning("could not read the queue depth", exc_info=True)
+            return False
+        finally:
+            try:
+                await connection.close()
+            except Exception:
+                logger.warning(
+                    "closing the drain connection failed; the broker reaps it",
+                    exc_info=True,
+                )
+
     async def aclose(self) -> None:
         """Close the connection; never raise.
 

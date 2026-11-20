@@ -88,14 +88,16 @@ class InboxReport:
     refused: int = 0
     dead_lettered: int = 0
 
-    def is_empty(self) -> bool:
-        return not (
-            self.received
-            or self.duplicates
-            or self.retried
-            or self.refused
-            or self.dead_lettered
-        )
+
+#: One inbox write inside the caller's session. Injected so the callback's
+#: decision table can be tested without a database.
+RecordEvent = Callable[[AsyncSession, Mapping[str, Any]], Awaitable[bool]]
+
+#: `--once` drain mode: how often to ask the broker whether the queue is empty,
+#: and how long to wait after the first "empty" reading for in-flight acks to
+#: settle before confirming the drain.
+DRAIN_POLL_SECONDS = 0.2
+DRAIN_SETTLE_SECONDS = 0.5
 
 
 async def _record_event(
@@ -132,6 +134,7 @@ class InboxConsumer:
         self._clock = clock
         self._report = InboxReport()
         self._last_report_at = clock()
+        self._last_success_at: float | None = None
         self._record = record
 
     async def __call__(self, message: AbstractIncomingMessage) -> None:
@@ -174,6 +177,9 @@ class InboxConsumer:
             # react. `sleep_or_stop` keeps shutdown responsive during the pause.
             await sleep_or_stop(self._stop, self._requeue_delay_seconds)
         else:
+            # A committed + acked message is the readiness proof: `idle_s` in the
+            # report is the time since this last happened.
+            self._last_success_at = self._clock()
             if recorded:
                 self._report.received += 1
                 # DEBUG, not INFO: the periodic report is what an operator reads;
@@ -187,11 +193,13 @@ class InboxConsumer:
             self.report()
 
     def report(self, *, force: bool = False) -> None:
-        """Log one line if the interval elapsed (or `force`), then reset.
+        """Log one heartbeat per interval (or on `force`), then reset counters.
 
-        Counters are per interval: a cumulative number makes an operator subtract
-        two lines to see the rate, and a quiet consumer must not keep repeating
-        its total. `force` is for shutdown, so the last interval is not lost.
+        Counters are per interval, so an operator reads the rate from one line.
+        The line is also the readiness signal: it is logged even when nothing
+        happened, because "alive but idle" and "dead" must be distinguishable —
+        and `idle_s` says how long ago the last message was committed and acked
+        (`never` if none ever was).
         """
         now = self._clock()
         if not force and now - self._last_report_at < self._report_interval_seconds:
@@ -199,17 +207,20 @@ class InboxConsumer:
 
         report, self._report = self._report, InboxReport()
         self._last_report_at = now
-        if report.is_empty():
-            return
-
+        idle_s = (
+            "never"
+            if self._last_success_at is None
+            else f"{now - self._last_success_at:.1f}"
+        )
         logger.info(
             "consumer report: received=%s duplicates=%s retried=%s "
-            "refused=%s dead_lettered=%s",
+            "refused=%s dead_lettered=%s idle_s=%s",
             report.received,
             report.duplicates,
             report.retried,
             report.refused,
             report.dead_lettered,
+            idle_s,
         )
 
     def _delivery_limit_reached(self, message: AbstractIncomingMessage) -> bool:
@@ -356,10 +367,69 @@ async def run_forever(stop: asyncio.Event | None = None) -> None:
     logger.info("event consumer stopped")
 
 
+async def run_once(*, drain_timeout: float = 30.0) -> int:
+    """Subscribe, drain the ready queue once, then stop.
+
+    A smoke and a catch-up run: exit `0` when the queue drained within
+    `drain_timeout`, `1` when it did not. "Drained" means "no ready messages",
+    read over a fresh connection; a short settle guards in-flight acks before the
+    consumer is closed.
+    """
+    stop = asyncio.Event()
+    install_signal_handlers(stop, logger=logger)
+
+    consumer = build_consumer(settings)
+    handler = InboxConsumer(
+        session_factory=SessionLocal,
+        stop=stop,
+        requeue_delay_seconds=settings.event_consumer_requeue_delay_seconds,
+        max_delivery_count=settings.event_consumer_max_delivery_count,
+        report_interval_seconds=settings.event_consumer_report_interval_seconds,
+    )
+
+    drained = False
+    try:
+        await consumer.start(handler)
+        deadline = time.monotonic() + drain_timeout
+        while not stop.is_set() and time.monotonic() < deadline:
+            if await consumer.drained():
+                # Confirm after a settle so the last ack lands before we close.
+                await sleep_or_stop(stop, DRAIN_SETTLE_SECONDS)
+                drained = await consumer.drained()
+                if drained:
+                    break
+            else:
+                await sleep_or_stop(stop, DRAIN_POLL_SECONDS)
+    finally:
+        # Flush the last interval: a stop must not hide what the process did.
+        handler.report(force=True)
+        try:
+            await consumer.aclose()
+        finally:
+            await engine.dispose()
+
+    if drained:
+        logger.info("event consumer drained and stopped")
+        return 0
+    logger.error("event consumer did not drain within %.1f s", drain_timeout)
+    return 1
+
+
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m app.event_consumer",
         description="Record the order events delivered by the broker.",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="drain the ready queue once, print a report and exit",
+    )
+    parser.add_argument(
+        "--drain-timeout",
+        type=float,
+        default=30.0,
+        help="seconds --once waits for the queue to drain (default: 30.0)",
     )
     parser.add_argument(
         "--log-level",
@@ -380,6 +450,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not settings.rabbitmq_url:
         logger.error("RABBITMQ_URL is required by python -m app.event_consumer")
         return 2
+
+    if args.once:
+        return asyncio.run(run_once(drain_timeout=args.drain_timeout))
 
     asyncio.run(run_forever())
     return 0

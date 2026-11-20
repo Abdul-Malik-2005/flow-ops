@@ -318,3 +318,41 @@ async def test_a_forced_report_flushes_the_last_interval(
         handler.report(force=True)
 
     assert "received=1" in caplog.text
+
+
+async def test_the_report_carries_an_idle_heartbeat(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = FakeClock()
+    journal: list[str] = []
+    handler = build_handler(
+        journal=journal,
+        report_interval_seconds=0.0,
+        clock=clock,
+    )
+
+    with caplog.at_level(logging.INFO, logger="app.event_consumer"):
+        handler.report()  # nothing handled yet
+        await handler(FakeMessage(envelope(), journal))
+        clock.advance(42.0)
+        handler.report()
+
+    # The heartbeat proves "alive": never processed, then just processed, then
+    # 42 s idle since the last success.
+    assert "idle_s=never" in caplog.text
+    assert "idle_s=0.0" in caplog.text
+    assert "idle_s=42.0" in caplog.text
+
+
+def test_the_parser_reads_the_once_mode() -> None:
+    args = entrypoint._parse_args(["--once", "--drain-timeout", "5"])
+
+    assert args.once is True
+    assert args.drain_timeout == 5.0
+
+
+def test_the_parser_defaults_to_run_forever() -> None:
+    args = entrypoint._parse_args([])
+
+    assert args.once is False
+    assert args.drain_timeout == 30.0

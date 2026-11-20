@@ -294,3 +294,106 @@ async def test_a_failing_close_is_logged_and_swallowed(
 def test_a_consumer_without_routing_keys_is_rejected() -> None:
     with pytest.raises(ValueError, match="routing key"):
         build_consumer(routing_keys=())
+
+
+# ---------------------------------------------------------------------------
+# Queue drain (used by `--once`)
+# ---------------------------------------------------------------------------
+
+
+class _DeclarationResult:
+    def __init__(self, message_count: int) -> None:
+        self.message_count = message_count
+
+
+class _DrainQueue:
+    def __init__(self, message_count: int) -> None:
+        self.declaration_result = _DeclarationResult(message_count)
+
+
+class _DrainChannel:
+    def __init__(self, message_count: int) -> None:
+        self._message_count = message_count
+        self.passive_declares: list[tuple[str, bool]] = []
+
+    async def declare_queue(
+        self,
+        name: str,
+        *,
+        durable: bool,
+        passive: bool = False,
+    ) -> _DrainQueue:
+        self.passive_declares.append((name, passive))
+        return _DrainQueue(self._message_count)
+
+
+class _DrainConnection:
+    def __init__(self, message_count: int) -> None:
+        self._message_count = message_count
+        self.channel_instance = _DrainChannel(message_count)
+        self.closed = 0
+
+    async def channel(self) -> _DrainChannel:
+        return self.channel_instance
+
+    async def close(self) -> None:
+        self.closed += 1
+
+
+def build_drain_consumer(
+    *,
+    message_count: int = 0,
+    error: BaseException | None = None,
+) -> tuple[RabbitMQEventConsumer, list[_DrainConnection]]:
+    connections: list[_DrainConnection] = []
+
+    async def connect(url: str, *, timeout: float) -> _DrainConnection:
+        if error is not None:
+            raise error
+        connection = _DrainConnection(message_count)
+        connections.append(connection)
+        return connection
+
+    consumer = RabbitMQEventConsumer(
+        url=URL,
+        exchange_name=EXCHANGE,
+        queue_name=QUEUE,
+        dead_letter_exchange=DLX,
+        dead_letter_queue=DLQ,
+        routing_keys=ROUTING_KEYS,
+        prefetch_count=PREFETCH,
+        max_delivery_count=DELIVERY_LIMIT,
+        connect=connect,  # type: ignore[arg-type]
+    )
+    return consumer, connections
+
+
+async def test_drained_true_when_no_ready_messages() -> None:
+    consumer, _ = build_drain_consumer(message_count=0)
+
+    assert await consumer.drained() is True
+
+
+async def test_drained_false_when_messages_are_ready() -> None:
+    consumer, _ = build_drain_consumer(message_count=3)
+
+    assert await consumer.drained() is False
+
+
+async def test_drained_reads_the_depth_passively_on_a_fresh_connection() -> None:
+    consumer, connections = build_drain_consumer(message_count=0)
+
+    await consumer.drained()
+
+    [connection] = connections
+    # A fresh, short-lived connection, closed again: a passive declare on the
+    # consuming channel reports a stale depth.
+    assert connection.channel_instance.passive_declares == [(QUEUE, True)]
+    assert connection.closed == 1
+
+
+async def test_drained_false_when_the_broker_is_unreachable() -> None:
+    consumer, _ = build_drain_consumer(error=RuntimeError("down"))
+
+    # "Not drained" is safer than raising: `--once` keeps waiting until timeout.
+    assert await consumer.drained() is False
